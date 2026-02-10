@@ -79,6 +79,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/")
+def root():
+    """Root endpoint — confirms service is live."""
+    return {
+        "service": CHATBOT_NAME,
+        "status": "running",
+        "endpoints": {
+            "health": "/health",
+            "chat": "/chat",
+            "ingest": "/ingest",
+            "config": "/config",
+        },
+    }
+
+
 # ── Request/Response Models ──
 
 

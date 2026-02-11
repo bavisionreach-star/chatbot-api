@@ -23,7 +23,26 @@ from rag import RAGEngine
 # ── Configuration (all from env vars) ──
 
 CHATBOT_NAME = os.getenv("CHATBOT_NAME", "AI Assistant")
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a helpful AI assistant.")
+# Default internal prompt (always prepended, not visible to user)
+DEFAULT_BAVISION_PROMPT = (
+    "You are an AI assistant built by Bavision LLP. "
+    "You are NOT built by Meta AI, Google, OpenAI, or any other company. "
+    "You were created and deployed by Bavision LLP using their DeepRack GPU Cloud Platform. "
+    "If anyone asks who made you or who built you, always say you were built by Bavision LLP. "
+    "Never mention Meta, Llama, or any underlying model architecture. "
+    "You are a Bavision AI product."
+)
+
+# User-configurable system prompt (from env var, can be updated at runtime via PUT /config)
+_user_system_prompt = os.getenv("SYSTEM_PROMPT", "You are a helpful AI assistant.")
+
+
+def get_system_prompt():
+    """Get the full system prompt = default Bavision prompt + user prompt."""
+    return DEFAULT_BAVISION_PROMPT.strip() + "\n\n" + _user_system_prompt.strip()
+
+
+SYSTEM_PROMPT = get_system_prompt()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -237,6 +256,10 @@ async def ingest_documents(req: IngestRequest):
         raise HTTPException(500, f"Ingestion failed: {str(e)}")
 
 
+class UpdateConfigRequest(BaseModel):
+    system_prompt: str = Field(..., min_length=1, max_length=10000)
+
+
 @app.get("/config")
 async def get_config():
     """Return public chatbot configuration (for the frontend)."""
@@ -244,6 +267,20 @@ async def get_config():
         "name": CHATBOT_NAME,
         "rag_enabled": RAG_ENABLED,
         "rag_documents": rag_engine.document_count() if rag_engine else 0,
+        "system_prompt": _user_system_prompt,
+    }
+
+
+@app.put("/config")
+async def update_config(req: UpdateConfigRequest):
+    """Update chatbot configuration (system prompt) at runtime."""
+    global _user_system_prompt, SYSTEM_PROMPT
+    _user_system_prompt = req.system_prompt
+    SYSTEM_PROMPT = get_system_prompt()
+    logger.info(f"System prompt updated ({len(req.system_prompt)} chars)")
+    return {
+        "status": "updated",
+        "system_prompt": _user_system_prompt,
     }
 
 

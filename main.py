@@ -11,8 +11,9 @@ import logging
 from typing import Optional
 from contextlib import asynccontextmanager
 
+import shutil
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -90,6 +91,8 @@ def root():
             "health": "/health",
             "chat": "/chat",
             "ingest": "/ingest",
+            "upload": "/upload",
+            "knowledge": "/knowledge",
             "config": "/config",
         },
     }
@@ -241,6 +244,155 @@ async def get_config():
         "name": CHATBOT_NAME,
         "rag_enabled": RAG_ENABLED,
         "rag_documents": rag_engine.document_count() if rag_engine else 0,
+    }
+
+
+
+
+@app.post("/upload")
+async def upload_documents(files: list[UploadFile] = File(...)):
+    """Upload documents for RAG ingestion. Accepts PDF, TXT, CSV, JSON, MD, JSONL."""
+    global rag_engine
+    if not RAG_ENABLED:
+        raise HTTPException(400, "RAG is disabled. Set RAG_ENABLED=true to enable.")
+
+    SUPPORTED = {".txt", ".md", ".csv", ".json", ".pdf", ".jsonl"}
+    MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB per file
+    data_dir = RAG_DATA_DIR
+
+    os.makedirs(data_dir, exist_ok=True)
+    saved_files = []
+    errors = []
+
+    for ufile in files:
+        ext = os.path.splitext(ufile.filename or "")[1].lower()
+        if ext not in SUPPORTED:
+            errors.append({"file": ufile.filename, "error": f"Unsupported format: {ext}"})
+            continue
+
+        try:
+            file_bytes = await ufile.read()
+        except Exception as e:
+            errors.append({"file": ufile.filename, "error": f"Read failed: {str(e)}"})
+            continue
+
+        if len(file_bytes) > MAX_FILE_SIZE:
+            errors.append({"file": ufile.filename, "error": f"File too large ({len(file_bytes) / 1024 / 1024:.1f} MB). Max: 20 MB"})
+            continue
+
+        if len(file_bytes) == 0:
+            errors.append({"file": ufile.filename, "error": "Empty file"})
+            continue
+
+        safe_name = ufile.filename.replace("/", "_").replace("\\", "_")
+        dest = os.path.join(data_dir, safe_name)
+        try:
+            with open(dest, "wb") as f:
+                f.write(file_bytes)
+            saved_files.append(safe_name)
+            logger.info(f"Saved uploaded file: {safe_name} ({len(file_bytes)} bytes)")
+        except Exception as e:
+            errors.append({"file": ufile.filename, "error": f"Save failed: {str(e)}"})
+
+    ingested = 0
+    total_chunks = 0
+    if saved_files:
+        try:
+            if rag_engine is None:
+                rag_engine = RAGEngine(data_dir=data_dir, db_dir=RAG_DB_DIR)
+            ingested = rag_engine.ingest(data_dir)
+            total_chunks = rag_engine.document_count()
+        except Exception as e:
+            logger.error(f"Ingestion after upload failed: {e}")
+            errors.append({"file": "ingestion", "error": str(e)})
+
+    return {
+        "status": "success" if saved_files else "failed",
+        "files_saved": saved_files,
+        "files_ingested": ingested,
+        "total_chunks": total_chunks,
+        "errors": errors,
+    }
+
+
+@app.get("/knowledge")
+async def get_knowledge_status():
+    """Get the current knowledge base status (files + chunks)."""
+    data_dir = RAG_DATA_DIR
+    SUPPORTED = {".txt", ".md", ".csv", ".json", ".pdf", ".jsonl"}
+
+    doc_files = []
+    if os.path.exists(data_dir):
+        for fname in sorted(os.listdir(data_dir)):
+            fpath = os.path.join(data_dir, fname)
+            if os.path.isfile(fpath):
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in SUPPORTED:
+                    doc_files.append({
+                        "name": fname,
+                        "size": os.path.getsize(fpath),
+                        "type": ext.lstrip(".").upper(),
+                    })
+
+    return {
+        "rag_enabled": RAG_ENABLED,
+        "total_chunks": rag_engine.document_count() if rag_engine else 0,
+        "files": doc_files,
+    }
+
+
+@app.delete("/knowledge")
+async def clear_knowledge():
+    """Clear the entire knowledge base and delete uploaded files."""
+    global rag_engine
+    if not RAG_ENABLED:
+        raise HTTPException(400, "RAG is disabled.")
+
+    if rag_engine:
+        rag_engine.clear()
+
+    data_dir = RAG_DATA_DIR
+    deleted = []
+    if os.path.exists(data_dir):
+        for fname in os.listdir(data_dir):
+            fpath = os.path.join(data_dir, fname)
+            if os.path.isfile(fpath):
+                try:
+                    os.remove(fpath)
+                    deleted.append(fname)
+                except Exception as e:
+                    logger.warning(f"Could not delete {fname}: {e}")
+
+    return {
+        "status": "success",
+        "files_deleted": len(deleted),
+        "total_chunks": 0,
+    }
+
+
+@app.delete("/knowledge/{filename}")
+async def delete_knowledge_file(filename: str):
+    """Delete a specific file from the knowledge base and re-ingest."""
+    global rag_engine
+    if not RAG_ENABLED:
+        raise HTTPException(400, "RAG is disabled.")
+
+    data_dir = RAG_DATA_DIR
+    fpath = os.path.join(data_dir, filename)
+    if not os.path.exists(fpath) or not os.path.isfile(fpath):
+        raise HTTPException(404, f"File not found: {filename}")
+
+    os.remove(fpath)
+    logger.info(f"Deleted knowledge file: {filename}")
+
+    if rag_engine:
+        rag_engine.clear()
+        rag_engine.ingest(data_dir)
+
+    return {
+        "status": "success",
+        "file_deleted": filename,
+        "total_chunks": rag_engine.document_count() if rag_engine else 0,
     }
 
 

@@ -1,25 +1,29 @@
 """
-DeepRack Chatbot / Agent API — FastAPI server with optional web research.
-Connects to an Ollama-powered LLM on a DeepRack GPU rack.
-All configuration is via environment variables — no code changes needed.
+DeepRack Agent API v4 — Research Agent with pipeline visualization + history.
 
-When ENABLED_TOOLS is set (e.g. "web_search,url_reader"), the API acts as
-a research agent that automatically searches the web before answering.
-When ENABLED_TOOLS is empty, it's a normal chatbot with optional RAG.
+When ENABLED_TOOLS is set, this acts as a research agent with:
+  - SSE pipeline progress events for animated UI
+  - SQLite database for research history
+  - Step-by-step visibility into the agentic pipeline
+
+When ENABLED_TOOLS is empty, it falls back to a normal chatbot.
 """
 
 import os
 import re
 import json
 import time
+import uuid
 import logging
 import asyncio
+import sqlite3
 import urllib.parse
+from datetime import datetime, timezone
 from typing import Optional
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi import FastAPI, HTTPException, File, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -33,7 +37,7 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
-logger = logging.getLogger("chatbot-api")
+logger = logging.getLogger("agent-api")
 
 # ═══════════════════════  CONFIG  ═══════════════════════
 
@@ -47,8 +51,8 @@ RAG_DB_DIR = os.getenv("RAG_DB_DIR", "/workspace/chromadb")
 MAX_CONTEXT_MESSAGES = int(os.getenv("MAX_CONTEXT_MESSAGES", "20"))
 MAX_RAG_CHUNKS = int(os.getenv("MAX_RAG_CHUNKS", "5"))
 PORT = int(os.getenv("PORT", "8000"))
+DB_PATH = os.getenv("DB_PATH", "/workspace/agent.db")
 
-# Agent tools — set ENABLED_TOOLS="web_search,url_reader" to activate agent mode
 _tools_raw = os.getenv("ENABLED_TOOLS", "")
 ENABLED_TOOLS = [t.strip() for t in _tools_raw.split(",") if t.strip()] if _tools_raw else []
 IS_AGENT = len(ENABLED_TOOLS) > 0
@@ -66,18 +70,67 @@ _user_system_prompt = os.getenv("SYSTEM_PROMPT", "You are a helpful AI assistant
 
 
 def get_system_prompt():
-    """Get the full system prompt = Bavision branding + user prompt."""
     return DEFAULT_BAVISION_PROMPT.strip() + "\n\n" + _user_system_prompt.strip()
 
 
 SYSTEM_PROMPT = get_system_prompt()
 
+
+# ═══════════════════════  DATABASE  ═══════════════════════
+
+
+def _init_db():
+    """Initialize SQLite database for research history."""
+    os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS research (
+            id TEXT PRIMARY KEY,
+            topic TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending',
+            search_queries TEXT DEFAULT '[]',
+            search_results TEXT DEFAULT '[]',
+            pages_read TEXT DEFAULT '[]',
+            llm_response TEXT DEFAULT '',
+            sources TEXT DEFAULT '[]',
+            pipeline_log TEXT DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            duration_seconds REAL,
+            error TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info(f"Database initialized at {DB_PATH}")
+
+
+def _db():
+    """Get a database connection."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _research_to_dict(row) -> dict:
+    """Convert a database row to a dict."""
+    d = dict(row)
+    for key in ("search_queries", "search_results", "pages_read", "sources", "pipeline_log"):
+        if d.get(key):
+            try:
+                d[key] = json.loads(d[key])
+            except Exception:
+                d[key] = []
+    return d
+
+
 # ═══════════════════  TOOL IMPLEMENTATIONS  ═══════════════════
-# These are only used when ENABLED_TOOLS includes the tool.
 
 
 async def web_search(query: str, max_results: int = 8) -> list[dict]:
-    """Search the web using DuckDuckGo HTML. Returns list of {title, url, snippet}."""
+    """Search the web using DuckDuckGo HTML."""
     logger.info(f"[web_search] Searching: {query}")
     try:
         url = "https://html.duckduckgo.com/html/"
@@ -101,7 +154,6 @@ async def web_search(query: str, max_results: int = 8) -> list[dict]:
                     html = resp.text
                     if "result__a" in html:
                         break
-                    # GET fallback
                     encoded_q = urllib.parse.quote_plus(query)
                     resp = await client.get(f"{url}?q={encoded_q}", headers=headers)
                     html = resp.text
@@ -113,7 +165,6 @@ async def web_search(query: str, max_results: int = 8) -> list[dict]:
                     await asyncio.sleep(1)
 
         if not html or "result__a" not in html:
-            logger.warning(f"[web_search] No results for: {query}")
             return []
 
         results = []
@@ -130,10 +181,7 @@ async def web_search(query: str, max_results: int = 8) -> list[dict]:
                 m = re.search(r"uddg=([^&]+)", link)
                 if m:
                     link = urllib.parse.unquote(m.group(1))
-            snippet = re.sub(
-                r"<[^>]+>", "", snippets[i] if i < len(snippets) else ""
-            ).strip()
-            # Skip ads / non-http links
+            snippet = re.sub(r"<[^>]+>", "", snippets[i] if i < len(snippets) else "").strip()
             if title and link and link.startswith("http") and "duckduckgo.com/y.js" not in link:
                 results.append({"title": title, "url": link, "snippet": snippet})
 
@@ -161,14 +209,10 @@ async def url_reader(url: str) -> str:
             resp.raise_for_status()
             html = resp.text
 
-        # Remove non-content
         for tag in ["script", "style", "nav", "header", "footer", "aside", "noscript", "iframe"]:
-            html = re.sub(
-                rf"<{tag}[^>]*>.*?</{tag}>", "", html, flags=re.DOTALL | re.IGNORECASE
-            )
+            html = re.sub(rf"<{tag}[^>]*>.*?</{tag}>", "", html, flags=re.DOTALL | re.IGNORECASE)
         html = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
 
-        # Try to find main content area
         main = ""
         for sel in [
             r"<article[^>]*>(.*?)</article>",
@@ -183,24 +227,16 @@ async def url_reader(url: str) -> str:
         if not main:
             main = html
 
-        # Block elements → newlines
         for tag in ["p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "br", "hr"]:
             main = re.sub(rf"</?{tag}[^>]*>", "\n", main, flags=re.IGNORECASE)
 
-        # Strip remaining tags
         text = re.sub(r"<[^>]+>", " ", main)
-        # Decode HTML entities
         text = (
-            text.replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", '"')
-            .replace("&#39;", "'")
-            .replace("&nbsp;", " ")
+            text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+            .replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " ")
         )
         text = re.sub(r"&#?\w+;", " ", text)
 
-        # Clean whitespace, skip short lines (nav items etc.)
         lines = []
         for line in text.split("\n"):
             line = re.sub(r"\s+", " ", line).strip()
@@ -219,95 +255,239 @@ async def url_reader(url: str) -> str:
         return ""
 
 
-# ═══════════════════  RESEARCH PIPELINE  ═══════════════════
+# ═══════════════════  RESEARCH PIPELINE WITH SSE  ═══════════════════
 
 
-async def do_research(user_query: str) -> str:
+async def run_research_pipeline(research_id: str, topic: str, description: str):
     """
-    Automatic web research pipeline for agent mode.
-    Searches the web, reads relevant pages, and returns a context block.
+    Execute the full research pipeline and store results in DB.
+    This runs in the background after the SSE stream is set up.
     """
-    if "web_search" not in ENABLED_TOOLS:
-        return ""
+    conn = _db()
+    start_time = time.time()
+    pipeline_log = []
+    all_results = []
+    page_contents = []
+    search_queries_used = []
 
-    logger.info(f"[research] Starting for: {user_query}")
-    start = time.time()
+    def _log(step: str, status: str, detail: str = "", data: dict = None):
+        entry = {
+            "step": step,
+            "status": status,
+            "detail": detail,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if data:
+            entry["data"] = data
+        pipeline_log.append(entry)
+        conn.execute(
+            "UPDATE research SET pipeline_log = ?, status = ? WHERE id = ?",
+            (json.dumps(pipeline_log), "running", research_id),
+        )
+        conn.commit()
 
-    # Generate search queries (the original + a variant)
-    queries = [user_query]
-    words = user_query.lower()
-    if "in " in words or "about " in words:
-        queries.append(user_query + " companies list")
-    if len(user_query.split()) > 5:
-        key = [
-            w
-            for w in user_query.split()
-            if len(w) > 3
-            and w.lower()
-            not in {
+    try:
+        # ── Step 1: Understanding the research topic ──
+        _log("understanding", "running", f"Analyzing research topic: {topic}")
+        await asyncio.sleep(0.5)  # Brief pause for UI animation
+
+        full_query = topic
+        if description:
+            full_query = f"{topic}: {description}"
+
+        _log("understanding", "done", "Research topic analyzed successfully")
+
+        # ── Step 2: Planning search strategy ──
+        _log("planning", "running", "Preparing search queries for sub-agents...")
+
+        queries = [full_query]
+        words = full_query.lower()
+        if "in " in words or "about " in words:
+            queries.append(full_query + " latest data 2025")
+        key_words = [
+            w for w in full_query.split()
+            if len(w) > 3 and w.lower() not in {
                 "about", "research", "comprehensive", "detailed",
-                "please", "write", "find", "india", "the",
+                "please", "write", "find", "the", "what", "how",
             }
         ]
-        if len(key) >= 2:
-            queries.append(" ".join(key[:5]))
+        if len(key_words) >= 2:
+            queries.append(" ".join(key_words[:5]) + " detailed analysis")
+        if len(queries) < 3:
+            queries.append(f"{topic} overview statistics facts")
 
-    # Run searches (max 2 to avoid rate-limiting)
-    all_results = []
-    seen_urls: set[str] = set()
-    for q in queries[:2]:
-        results = await web_search(q)
-        for r in results:
-            if r["url"] not in seen_urls:
-                all_results.append(r)
-                seen_urls.add(r["url"])
-        if results:
-            await asyncio.sleep(0.5)
+        search_queries_used = queries[:3]
+        _log("planning", "done", f"Prepared {len(search_queries_used)} search queries", {
+            "queries": search_queries_used
+        })
 
-    if not all_results:
-        logger.warning("[research] No search results found")
-        return ""
+        conn.execute(
+            "UPDATE research SET search_queries = ? WHERE id = ?",
+            (json.dumps(search_queries_used), research_id),
+        )
+        conn.commit()
 
-    # Read top 3-4 pages concurrently
-    page_contents: list[dict] = []
-    if "url_reader" in ENABLED_TOOLS:
-        urls = [r["url"] for r in all_results[:4]]
-        tasks = [url_reader(u) for u in urls]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for u, content in zip(urls, results):
-            if isinstance(content, str) and content.strip():
-                page_contents.append({"url": u, "content": content})
+        # ── Step 3: Sub-agents searching the web ──
+        _log("searching", "running", "Sub-agents are searching the web...")
 
-    elapsed = time.time() - start
-    logger.info(
-        f"[research] Done in {elapsed:.1f}s — "
-        f"{len(all_results)} search results, {len(page_contents)} pages read"
-    )
+        seen_urls: set[str] = set()
+        for i, q in enumerate(search_queries_used):
+            _log("searching", "running", f"Agent {i + 1}/{len(search_queries_used)}: Searching \"{q}\"")
+            results = await web_search(q)
+            for r in results:
+                if r["url"] not in seen_urls:
+                    all_results.append(r)
+                    seen_urls.add(r["url"])
+            if results:
+                await asyncio.sleep(0.5)
 
-    # Build context block
-    ctx = "## WEB RESEARCH RESULTS\n\n"
-    ctx += "The following information was gathered from real web searches.\n"
-    ctx += "Use ONLY this information to answer. Do NOT add facts not found below.\n\n"
+        _log("searching", "done", f"Found {len(all_results)} search results across {len(search_queries_used)} queries", {
+            "result_count": len(all_results),
+            "results": [{"title": r["title"], "url": r["url"]} for r in all_results[:12]],
+        })
 
-    ctx += "### Search Results:\n\n"
-    for i, r in enumerate(all_results[:8], 1):
-        ctx += f"{i}. **{r['title']}**\n"
-        ctx += f"   URL: {r['url']}\n"
-        if r.get("snippet"):
-            ctx += f"   {r['snippet']}\n"
-        ctx += "\n"
+        conn.execute(
+            "UPDATE research SET search_results = ? WHERE id = ?",
+            (json.dumps(all_results[:12]), research_id),
+        )
+        conn.commit()
 
-    if page_contents:
-        ctx += "\n### Detailed Page Contents:\n\n"
-        for pc in page_contents:
-            ctx += f"--- Content from {pc['url']} ---\n"
-            ctx += pc["content"] + "\n\n"
+        if not all_results:
+            _log("searching", "error", "No search results found. Try a different topic.")
+            conn.execute(
+                "UPDATE research SET status = 'failed', error = 'No search results found' WHERE id = ?",
+                (research_id,),
+            )
+            conn.commit()
+            conn.close()
+            return
 
-    # Keep context under 20k chars to fit in LLM context window
-    if len(ctx) > 20000:
-        ctx = ctx[:20000] + "\n\n[Research data truncated]"
+        # ── Step 4: Agents collecting detailed data ──
+        _log("collecting", "running", "Reading and extracting data from top sources...")
 
-    return ctx
+        if "url_reader" in ENABLED_TOOLS:
+            urls_to_read = [r["url"] for r in all_results[:5]]
+            tasks = [url_reader(u) for u in urls_to_read]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for u, content in zip(urls_to_read, results):
+                if isinstance(content, str) and content.strip():
+                    page_contents.append({"url": u, "content": content})
+                    _log("collecting", "running", f"Extracted data from {u[:60]}...")
+
+        _log("collecting", "done", f"Successfully read {len(page_contents)} pages", {
+            "pages_read": len(page_contents),
+            "sources": [pc["url"] for pc in page_contents],
+        })
+
+        conn.execute(
+            "UPDATE research SET pages_read = ? WHERE id = ?",
+            (json.dumps([{"url": pc["url"], "chars": len(pc["content"])} for pc in page_contents]), research_id),
+        )
+        conn.commit()
+
+        # ── Step 5: LLM analyzing collected data ──
+        _log("analyzing", "running", "AI is analyzing all collected data...")
+
+        research_context = "## WEB RESEARCH RESULTS\n\n"
+        research_context += "The following information was gathered from real web searches.\n"
+        research_context += "Use ONLY this information to answer. Do NOT add facts not found below.\n\n"
+
+        research_context += "### Search Results:\n\n"
+        for i, r in enumerate(all_results[:10], 1):
+            research_context += f"{i}. **{r['title']}**\n"
+            research_context += f"   URL: {r['url']}\n"
+            if r.get("snippet"):
+                research_context += f"   {r['snippet']}\n"
+            research_context += "\n"
+
+        if page_contents:
+            research_context += "\n### Detailed Page Contents:\n\n"
+            for pc in page_contents:
+                research_context += f"--- Content from {pc['url']} ---\n"
+                research_context += pc["content"] + "\n\n"
+
+        if len(research_context) > 20000:
+            research_context = research_context[:20000] + "\n\n[Research data truncated]"
+
+        _log("analyzing", "done", f"Processed {len(research_context)} characters of research data")
+
+        # ── Step 6: LLM generating research report ──
+        _log("generating", "running", "AI is writing the research report...")
+
+        system_prompt = SYSTEM_PROMPT + "\n\n" + research_context
+        system_prompt += (
+            "\n\n## INSTRUCTIONS\n"
+            "Write a comprehensive, well-structured research report based on the web research above.\n"
+            "- Use ONLY facts from the research data. Do NOT make up companies, statistics, or URLs.\n"
+            "- Structure with clear headings: Executive Summary, Key Findings, Detailed Analysis, Sources.\n"
+            "- Cite sources by including their real URLs.\n"
+            "- If you found specific companies/data, list them with details from the pages.\n"
+            "- Be thorough, factual, and professional.\n"
+            "- Use markdown formatting for readability."
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Research Topic: {topic}\n\nDescription: {description or 'Provide a comprehensive analysis'}"},
+        ]
+
+        llm_response = ""
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                resp = await client.post(
+                    f"{OLLAMA_URL}/api/chat",
+                    json={
+                        "model": OLLAMA_MODEL,
+                        "messages": messages,
+                        "stream": False,
+                        "options": {"temperature": 0.3, "num_predict": 4096},
+                    },
+                )
+                data = resp.json()
+                llm_response = data.get("message", {}).get("content", "")
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}")
+            llm_response = f"Error generating report: {str(e)}"
+
+        _log("generating", "done", f"Research report generated ({len(llm_response)} chars)")
+
+        # ── Step 7: Finalizing ──
+        _log("complete", "done", "Research ready for preview")
+
+        elapsed = time.time() - start_time
+        sources = [{"title": r["title"], "url": r["url"]} for r in all_results[:12]]
+
+        conn.execute(
+            """UPDATE research SET
+                status = 'completed',
+                llm_response = ?,
+                sources = ?,
+                pipeline_log = ?,
+                completed_at = ?,
+                duration_seconds = ?
+            WHERE id = ?""",
+            (
+                llm_response,
+                json.dumps(sources),
+                json.dumps(pipeline_log),
+                datetime.now(timezone.utc).isoformat(),
+                round(elapsed, 1),
+                research_id,
+            ),
+        )
+        conn.commit()
+        logger.info(f"[research] {research_id} completed in {elapsed:.1f}s")
+
+    except Exception as e:
+        logger.error(f"[research] Pipeline error: {e}", exc_info=True)
+        _log("error", "error", str(e))
+        conn.execute(
+            "UPDATE research SET status = 'failed', error = ?, pipeline_log = ? WHERE id = ?",
+            (str(e), json.dumps(pipeline_log), research_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ═══════════════════  RAG ENGINE  ═══════════════════
@@ -318,6 +498,8 @@ rag_engine: Optional[RAGEngine] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global rag_engine
+    _init_db()
+
     if RAG_ENABLED:
         try:
             rag_engine = RAGEngine(data_dir=RAG_DATA_DIR, db_dir=RAG_DB_DIR)
@@ -326,31 +508,29 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"RAG engine initialization skipped: {e}")
             rag_engine = None
-    else:
-        logger.info("RAG disabled via RAG_ENABLED=false")
 
     mode = "agent" if IS_AGENT else "chatbot"
     logger.info(
-        f"Chatbot '{CHATBOT_NAME}' started — "
-        f"mode={mode}, Ollama at {OLLAMA_URL}, model {OLLAMA_MODEL}"
+        f"Agent '{CHATBOT_NAME}' started — "
+        f"mode={mode}, Ollama={OLLAMA_URL}, model={OLLAMA_MODEL}"
         + (f", tools: {ENABLED_TOOLS}" if ENABLED_TOOLS else "")
     )
     yield
-    logger.info("Chatbot API shutting down")
+    logger.info("Agent API shutting down")
 
 
 # ═══════════════════  FASTAPI APP  ═══════════════════
 
 app = FastAPI(
     title=f"{CHATBOT_NAME} API",
-    description="AI Chatbot / Agent API powered by DeepRack",
-    version="3.0.0",
+    description="AI Agent API with research pipeline — powered by DeepRack",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -358,6 +538,11 @@ app.add_middleware(
 
 
 # ── Models ──
+
+class StartResearchRequest(BaseModel):
+    topic: str = Field(..., min_length=1, max_length=500)
+    description: str = Field("", max_length=2000)
+
 
 class ChatMessage(BaseModel):
     role: str = Field(..., pattern="^(user|assistant|system)$")
@@ -369,21 +554,18 @@ class ChatRequest(BaseModel):
     stream: bool = True
 
 
-class IngestRequest(BaseModel):
-    directory: str = RAG_DATA_DIR
-
-
 class UpdateConfigRequest(BaseModel):
     system_prompt: str = Field(..., min_length=1, max_length=10000)
 
 
+class IngestRequest(BaseModel):
+    directory: str = RAG_DATA_DIR
+
+
 # ── Helpers ──
 
-
 def _build_system_prompt(user_query: str) -> str:
-    """Build the full system prompt, optionally with RAG context."""
     base = SYSTEM_PROMPT
-
     if rag_engine and RAG_ENABLED:
         try:
             chunks = rag_engine.search(user_query, top_k=MAX_RAG_CHUNKS)
@@ -391,13 +573,11 @@ def _build_system_prompt(user_query: str) -> str:
                 ctx = "\n\n---\n\n".join(c["text"] for c in chunks)
                 base += (
                     "\n\n## Relevant Context from Knowledge Base\n"
-                    "Use the following information to answer the user's question. "
-                    "If the information is not relevant, rely on your general knowledge.\n\n"
+                    "Use the following information to answer the user's question.\n\n"
                     + ctx
                 )
         except Exception as e:
             logger.warning(f"RAG search failed: {e}")
-
     return base
 
 
@@ -410,13 +590,12 @@ def root():
         "service": CHATBOT_NAME,
         "status": "running",
         "mode": "agent" if IS_AGENT else "chatbot",
+        "version": "4.0.0",
         "endpoints": {
             "health": "/health",
+            "research": "/research",
+            "research_stream": "/research/{id}/stream",
             "chat": "/chat",
-            "ingest": "/ingest",
-            "upload": "/upload",
-            "knowledge": "/knowledge",
-            "config": "/config",
         },
     }
 
@@ -429,91 +608,205 @@ async def health():
             resp = await client.get(f"{OLLAMA_URL}/api/tags")
             models = resp.json().get("models", [])
             ollama_ok = any(
-                m.get("name", "").startswith(OLLAMA_MODEL.split(":")[0])
-                for m in models
+                m.get("name", "").startswith(OLLAMA_MODEL.split(":")[0]) for m in models
             )
     except Exception:
         pass
+
+    conn = _db()
+    research_count = conn.execute("SELECT COUNT(*) FROM research").fetchone()[0]
+    conn.close()
+
     return {
         "status": "healthy" if ollama_ok else "degraded",
         "chatbot_name": CHATBOT_NAME,
         "model": OLLAMA_MODEL,
         "ollama_connected": ollama_ok,
-        "rag_enabled": RAG_ENABLED,
-        "rag_documents": rag_engine.document_count() if rag_engine else 0,
+        "is_agent": IS_AGENT,
+        "tools": ENABLED_TOOLS,
+        "research_count": research_count,
     }
+
+
+# ═══════════════════  RESEARCH ENDPOINTS  ═══════════════════
+
+
+@app.post("/research")
+async def start_research(req: StartResearchRequest):
+    """Start a new research task. Returns research ID for tracking."""
+    research_id = uuid.uuid4().hex[:12]
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = _db()
+    conn.execute(
+        "INSERT INTO research (id, topic, description, status, created_at) VALUES (?, ?, ?, 'running', ?)",
+        (research_id, req.topic, req.description, now),
+    )
+    conn.commit()
+    conn.close()
+
+    # Start the pipeline in the background
+    asyncio.create_task(run_research_pipeline(research_id, req.topic, req.description))
+
+    logger.info(f"[research] Started {research_id}: {req.topic}")
+    return {"research_id": research_id, "status": "running"}
+
+
+@app.get("/research/{research_id}/stream")
+async def stream_research(research_id: str):
+    """
+    SSE stream of pipeline progress for a research task.
+    The client connects to this after POST /research to watch progress.
+    """
+    conn = _db()
+    row = conn.execute("SELECT id FROM research WHERE id = ?", (research_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "Research not found")
+
+    async def event_stream():
+        last_log_len = 0
+        while True:
+            conn = _db()
+            row = conn.execute(
+                "SELECT status, pipeline_log, llm_response, sources, search_results, pages_read, duration_seconds FROM research WHERE id = ?",
+                (research_id,),
+            ).fetchone()
+            conn.close()
+
+            if not row:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Research not found'})}\n\n"
+                break
+
+            status = row["status"]
+            try:
+                log = json.loads(row["pipeline_log"] or "[]")
+            except Exception:
+                log = []
+
+            # Send any new pipeline steps
+            if len(log) > last_log_len:
+                for entry in log[last_log_len:]:
+                    yield f"data: {json.dumps({'type': 'step', **entry})}\n\n"
+                last_log_len = len(log)
+
+            if status in ("completed", "failed"):
+                # Send final result
+                try:
+                    sources = json.loads(row["sources"] or "[]")
+                except Exception:
+                    sources = []
+                try:
+                    search_results = json.loads(row["search_results"] or "[]")
+                except Exception:
+                    search_results = []
+                try:
+                    pages_read = json.loads(row["pages_read"] or "[]")
+                except Exception:
+                    pages_read = []
+
+                final = {
+                    "type": "complete" if status == "completed" else "error",
+                    "status": status,
+                    "response": row["llm_response"] or "",
+                    "sources": sources,
+                    "search_results": search_results,
+                    "pages_read": pages_read,
+                    "duration_seconds": row["duration_seconds"],
+                }
+                yield f"data: {json.dumps(final)}\n\n"
+                break
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/research/{research_id}")
+async def get_research(research_id: str):
+    """Get a specific research result."""
+    conn = _db()
+    row = conn.execute("SELECT * FROM research WHERE id = ?", (research_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "Research not found")
+    return _research_to_dict(row)
+
+
+@app.get("/research")
+async def list_research(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """List research history, newest first."""
+    conn = _db()
+    rows = conn.execute(
+        "SELECT id, topic, description, status, created_at, completed_at, duration_seconds FROM research ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    ).fetchall()
+    total = conn.execute("SELECT COUNT(*) FROM research").fetchone()[0]
+    conn.close()
+    return {
+        "items": [dict(r) for r in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.delete("/research/{research_id}")
+async def delete_research(research_id: str):
+    """Delete a research entry."""
+    conn = _db()
+    row = conn.execute("SELECT id FROM research WHERE id = ?", (research_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "Research not found")
+    conn.execute("DELETE FROM research WHERE id = ?", (research_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted", "id": research_id}
+
+
+# ═══════════════════  CHAT ENDPOINT (fallback for chatbot mode)  ═══════════════════
 
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    """
-    Chat endpoint — works in two modes:
-    • **Chatbot mode** (default): sends messages straight to LLM (+ RAG).
-    • **Agent mode** (ENABLED_TOOLS set): automatically searches the web,
-      reads pages, and injects the findings into the system prompt before
-      the LLM generates a response.
-    """
+    """Chat endpoint — standard chatbot mode (RAG-enabled)."""
     user_messages = [m for m in req.messages if m.role == "user"]
     latest_query = user_messages[-1].content if user_messages else ""
-    logger.info(f"[chat] User: {latest_query[:120]}...")
-
-    # ── Agent mode: auto-research ──
-    research_context = ""
-    if IS_AGENT:
-        try:
-            research_context = await do_research(latest_query)
-        except Exception as e:
-            logger.error(f"[chat] Research failed: {e}", exc_info=True)
-
-    # ── Build final system prompt ──
     system_prompt = _build_system_prompt(latest_query)
-
-    if research_context:
-        system_prompt += "\n\n" + research_context
-        system_prompt += (
-            "\n\n## INSTRUCTIONS\n"
-            "Write a comprehensive, well-structured response based on the web research above.\n"
-            "- Use ONLY facts from the research data. Do NOT make up companies, statistics, or URLs.\n"
-            "- Structure your answer with clear headings and sections.\n"
-            "- Cite sources by including their real URLs.\n"
-            "- If you found specific companies, list them with details from the pages.\n"
-            "- Be thorough but factual."
-        )
-
-    logger.info(
-        f"[chat] System prompt: {len(system_prompt)} chars"
-        + (f", research: {len(research_context)} chars" if research_context else "")
-    )
 
     messages = [{"role": "system", "content": system_prompt}]
     for m in req.messages[-MAX_CONTEXT_MESSAGES:]:
         messages.append({"role": m.role, "content": m.content})
 
     if req.stream:
-
         async def generate():
             try:
                 async with httpx.AsyncClient(timeout=180.0) as client:
                     async with client.stream(
-                        "POST",
-                        f"{OLLAMA_URL}/api/chat",
-                        json={
-                            "model": OLLAMA_MODEL,
-                            "messages": messages,
-                            "stream": True,
-                            "options": {"temperature": 0.3, "num_predict": 4096},
-                        },
+                        "POST", f"{OLLAMA_URL}/api/chat",
+                        json={"model": OLLAMA_MODEL, "messages": messages, "stream": True,
+                              "options": {"temperature": 0.3, "num_predict": 4096}},
                     ) as response:
                         async for line in response.aiter_lines():
                             if line.strip():
                                 yield line + "\n"
             except httpx.ConnectError:
-                yield (
-                    '{"error": "AI model is starting up. Please try again in a moment."}\n'
-                )
+                yield '{"error": "AI model is starting up. Please try again."}\n'
             except Exception as e:
                 logger.error(f"Chat stream error: {e}")
-                yield '{"error": "Something went wrong. Please try again."}\n'
+                yield '{"error": "Something went wrong."}\n'
 
         return StreamingResponse(generate(), media_type="text/event-stream")
     else:
@@ -521,18 +814,13 @@ async def chat(req: ChatRequest):
             async with httpx.AsyncClient(timeout=180.0) as client:
                 resp = await client.post(
                     f"{OLLAMA_URL}/api/chat",
-                    json={
-                        "model": OLLAMA_MODEL,
-                        "messages": messages,
-                        "stream": False,
-                        "options": {"temperature": 0.3, "num_predict": 4096},
-                    },
+                    json={"model": OLLAMA_MODEL, "messages": messages, "stream": False,
+                          "options": {"temperature": 0.3, "num_predict": 4096}},
                 )
                 return resp.json()
         except httpx.ConnectError:
             raise HTTPException(503, "AI model is currently unavailable.")
         except Exception as e:
-            logger.error(f"Chat error: {e}")
             raise HTTPException(500, "Chat failed")
 
 
@@ -543,20 +831,15 @@ async def chat(req: ChatRequest):
 async def ingest_documents(req: IngestRequest):
     global rag_engine
     if not RAG_ENABLED:
-        raise HTTPException(400, "RAG is disabled. Set RAG_ENABLED=true to enable.")
+        raise HTTPException(400, "RAG is disabled.")
     try:
         if rag_engine is None:
             rag_engine = RAGEngine(data_dir=req.directory, db_dir=RAG_DB_DIR)
         count = rag_engine.ingest(req.directory)
-        return {
-            "status": "success",
-            "documents_ingested": count,
-            "total_chunks": rag_engine.document_count(),
-        }
+        return {"status": "success", "documents_ingested": count, "total_chunks": rag_engine.document_count()}
     except FileNotFoundError:
         raise HTTPException(404, f"Directory not found: {req.directory}")
     except Exception as e:
-        logger.error(f"Ingestion error: {e}")
         raise HTTPException(500, f"Ingestion failed: {str(e)}")
 
 
@@ -564,74 +847,49 @@ async def ingest_documents(req: IngestRequest):
 async def upload_documents(files: list[UploadFile] = File(...)):
     global rag_engine
     if not RAG_ENABLED:
-        raise HTTPException(400, "RAG is disabled. Set RAG_ENABLED=true to enable.")
+        raise HTTPException(400, "RAG is disabled.")
 
     SUPPORTED = {".txt", ".md", ".csv", ".json", ".pdf", ".jsonl"}
-    MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
-    data_dir = RAG_DATA_DIR
-    os.makedirs(data_dir, exist_ok=True)
+    MAX_FILE_SIZE = 20 * 1024 * 1024
+    os.makedirs(RAG_DATA_DIR, exist_ok=True)
 
-    saved_files = []
-    errors = []
-    for ufile in files:
-        ext = os.path.splitext(ufile.filename or "")[1].lower()
+    saved, errors = [], []
+    for f in files:
+        ext = os.path.splitext(f.filename or "")[1].lower()
         if ext not in SUPPORTED:
-            errors.append({"file": ufile.filename, "error": f"Unsupported format: {ext}"})
+            errors.append({"file": f.filename, "error": f"Unsupported: {ext}"})
             continue
-        try:
-            file_bytes = await ufile.read()
-        except Exception as e:
-            errors.append({"file": ufile.filename, "error": f"Read failed: {str(e)}"})
+        data = await f.read()
+        if len(data) > MAX_FILE_SIZE:
+            errors.append({"file": f.filename, "error": "Too large"})
             continue
-        if len(file_bytes) > MAX_FILE_SIZE:
-            errors.append({
-                "file": ufile.filename,
-                "error": f"File too large ({len(file_bytes) / 1024 / 1024:.1f} MB). Max: 20 MB",
-            })
+        if not data:
+            errors.append({"file": f.filename, "error": "Empty"})
             continue
-        if len(file_bytes) == 0:
-            errors.append({"file": ufile.filename, "error": "Empty file"})
-            continue
+        dest = os.path.join(RAG_DATA_DIR, f.filename.replace("/", "_").replace("\\", "_"))
+        with open(dest, "wb") as out:
+            out.write(data)
+        saved.append(f.filename)
 
-        safe_name = ufile.filename.replace("/", "_").replace("\\", "_")
-        dest = os.path.join(data_dir, safe_name)
-        try:
-            with open(dest, "wb") as f:
-                f.write(file_bytes)
-            saved_files.append(safe_name)
-            logger.info(f"Saved uploaded file: {safe_name} ({len(file_bytes)} bytes)")
-        except Exception as e:
-            errors.append({"file": ufile.filename, "error": f"Save failed: {str(e)}"})
-
-    ingested = 0
-    total_chunks = 0
-    if saved_files:
+    ingested = total = 0
+    if saved:
         try:
             if rag_engine is None:
-                rag_engine = RAGEngine(data_dir=data_dir, db_dir=RAG_DB_DIR)
-            ingested = rag_engine.ingest(data_dir)
-            total_chunks = rag_engine.document_count()
+                rag_engine = RAGEngine(data_dir=RAG_DATA_DIR, db_dir=RAG_DB_DIR)
+            ingested = rag_engine.ingest(RAG_DATA_DIR)
+            total = rag_engine.document_count()
         except Exception as e:
-            logger.error(f"Ingestion after upload failed: {e}")
             errors.append({"file": "ingestion", "error": str(e)})
 
-    return {
-        "status": "success" if saved_files else "failed",
-        "files_saved": saved_files,
-        "files_ingested": ingested,
-        "total_chunks": total_chunks,
-        "errors": errors,
-    }
+    return {"status": "success" if saved else "failed", "files_saved": saved,
+            "files_ingested": ingested, "total_chunks": total, "errors": errors}
 
 
 @app.get("/config")
 async def get_config():
-    return {
-        "name": CHATBOT_NAME,
-        "rag_enabled": RAG_ENABLED,
-        "rag_documents": rag_engine.document_count() if rag_engine else 0,
-        "system_prompt": _user_system_prompt,
-    }
+    return {"name": CHATBOT_NAME, "rag_enabled": RAG_ENABLED,
+            "rag_documents": rag_engine.document_count() if rag_engine else 0,
+            "system_prompt": _user_system_prompt}
 
 
 @app.put("/config")
@@ -639,7 +897,6 @@ async def update_config(req: UpdateConfigRequest):
     global _user_system_prompt, SYSTEM_PROMPT
     _user_system_prompt = req.system_prompt
     SYSTEM_PROMPT = get_system_prompt()
-    logger.info(f"System prompt updated ({len(req.system_prompt)} chars)")
     return {"status": "updated", "system_prompt": _user_system_prompt}
 
 
@@ -653,16 +910,8 @@ async def get_knowledge_status():
             if os.path.isfile(fpath):
                 ext = os.path.splitext(fname)[1].lower()
                 if ext in SUPPORTED:
-                    doc_files.append({
-                        "name": fname,
-                        "size": os.path.getsize(fpath),
-                        "type": ext.lstrip(".").upper(),
-                    })
-    return {
-        "rag_enabled": RAG_ENABLED,
-        "total_chunks": rag_engine.document_count() if rag_engine else 0,
-        "files": doc_files,
-    }
+                    doc_files.append({"name": fname, "size": os.path.getsize(fpath), "type": ext.lstrip(".").upper()})
+    return {"rag_enabled": RAG_ENABLED, "total_chunks": rag_engine.document_count() if rag_engine else 0, "files": doc_files}
 
 
 @app.delete("/knowledge")
@@ -680,9 +929,9 @@ async def clear_knowledge():
                 try:
                     os.remove(fpath)
                     deleted.append(fname)
-                except Exception as e:
-                    logger.warning(f"Could not delete {fname}: {e}")
-    return {"status": "success", "files_deleted": len(deleted), "total_chunks": 0}
+                except Exception:
+                    pass
+    return {"status": "success", "files_deleted": len(deleted)}
 
 
 @app.delete("/knowledge/{filename}")
@@ -691,23 +940,15 @@ async def delete_knowledge_file(filename: str):
     if not RAG_ENABLED:
         raise HTTPException(400, "RAG is disabled.")
     fpath = os.path.join(RAG_DATA_DIR, filename)
-    if not os.path.exists(fpath) or not os.path.isfile(fpath):
-        raise HTTPException(404, f"File not found: {filename}")
+    if not os.path.exists(fpath):
+        raise HTTPException(404, f"Not found: {filename}")
     os.remove(fpath)
-    logger.info(f"Deleted knowledge file: {filename}")
     if rag_engine:
         rag_engine.clear()
         rag_engine.ingest(RAG_DATA_DIR)
-    return {
-        "status": "success",
-        "file_deleted": filename,
-        "total_chunks": rag_engine.document_count() if rag_engine else 0,
-    }
+    return {"status": "success", "file_deleted": filename}
 
-
-# ── Entry point ──
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)

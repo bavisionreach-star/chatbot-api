@@ -129,26 +129,33 @@ def _research_to_dict(row) -> dict:
 # ═══════════════════  TOOL IMPLEMENTATIONS  ═══════════════════
 
 
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+]
+
+
 async def web_search(query: str, max_results: int = 8) -> list[dict]:
-    """Search the web using DuckDuckGo HTML."""
+    """Search the web using DuckDuckGo HTML with exponential backoff."""
     logger.info(f"[web_search] Searching: {query}")
     try:
         url = "https://html.duckduckgo.com/html/"
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://duckduckgo.com/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        }
         form_data = {"q": query, "b": "", "kl": ""}
 
         html = ""
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            for attempt in range(3):
+        max_retries = 6
+        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+            for attempt in range(max_retries):
+                ua = _USER_AGENTS[attempt % len(_USER_AGENTS)]
+                headers = {
+                    "User-Agent": ua,
+                    "Referer": "https://duckduckgo.com/",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                }
                 try:
                     resp = await client.post(url, data=form_data, headers=headers)
                     html = resp.text
@@ -159,12 +166,16 @@ async def web_search(query: str, max_results: int = 8) -> list[dict]:
                     html = resp.text
                     if "result__a" in html:
                         break
-                    await asyncio.sleep(1)
+                    # Exponential backoff: 2, 4, 6, 8, 10 seconds
+                    wait = min(2 * (attempt + 1), 10)
+                    logger.info(f"[web_search] Attempt {attempt + 1}/{max_retries} got no results, retrying in {wait}s...")
+                    await asyncio.sleep(wait)
                 except Exception as e:
                     logger.warning(f"[web_search] Attempt {attempt + 1} error: {e}")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2 * (attempt + 1))
 
         if not html or "result__a" not in html:
+            logger.warning(f"[web_search] No results after {max_retries} attempts for: {query}")
             return []
 
         results = []
@@ -338,8 +349,9 @@ async def run_research_pipeline(research_id: str, topic: str, description: str):
                 if r["url"] not in seen_urls:
                     all_results.append(r)
                     seen_urls.add(r["url"])
-            if results:
-                await asyncio.sleep(0.5)
+            # Wait between queries to avoid rate-limiting
+            if i < len(search_queries_used) - 1:
+                await asyncio.sleep(2)
 
         _log("searching", "done", f"Found {len(all_results)} search results across {len(search_queries_used)} queries", {
             "result_count": len(all_results),
@@ -353,14 +365,8 @@ async def run_research_pipeline(research_id: str, topic: str, description: str):
         conn.commit()
 
         if not all_results:
-            _log("searching", "error", "No search results found. Try a different topic.")
-            conn.execute(
-                "UPDATE research SET status = 'failed', error = 'No search results found' WHERE id = ?",
-                (research_id,),
-            )
-            conn.commit()
-            conn.close()
-            return
+            logger.warning(f"[research] No search results for {research_id}, proceeding with LLM general knowledge")
+            _log("searching", "done", "Web search returned no results — will use AI general knowledge instead")
 
         # ── Step 4: Agents collecting detailed data ──
         _log("collecting", "running", "Reading and extracting data from top sources...")
@@ -389,8 +395,13 @@ async def run_research_pipeline(research_id: str, topic: str, description: str):
         _log("analyzing", "running", "AI is analyzing all collected data...")
 
         research_context = "## WEB RESEARCH RESULTS\n\n"
-        research_context += "The following information was gathered from real web searches.\n"
-        research_context += "Use ONLY this information to answer. Do NOT add facts not found below.\n\n"
+        if all_results or page_contents:
+            research_context += "The following information was gathered from real web searches.\n"
+            research_context += "Use ONLY this information to answer. Do NOT add facts not found below.\n\n"
+        else:
+            research_context += "NOTE: Web search returned no results (search engine rate-limited).\n"
+            research_context += "Provide a helpful response based on your general knowledge. "
+            research_context += "Clearly state that live web data was unavailable and the response is based on general knowledge.\n\n"
 
         research_context += "### Search Results:\n\n"
         for i, r in enumerate(all_results[:10], 1):

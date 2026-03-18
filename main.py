@@ -518,9 +518,30 @@ class UpdateConfigRequest(BaseModel):
 # ── Helpers ──
 
 
-def _build_system_prompt(user_query: str) -> str:
-    """Build the full system prompt, optionally with RAG context."""
+def _build_system_prompt(user_query: str, conversation_messages: list = None) -> str:
+    """Build the full system prompt, optionally with RAG context and notification instructions."""
     base = SYSTEM_PROMPT
+
+    # Inject notification-aware behaviour when email notifications are enabled
+    if _notification_config["enabled"] and _notification_config["notify_when"]:
+        notify_when = _notification_config["notify_when"]
+        base += (
+            "\n\n## ENQUIRY COLLECTION INSTRUCTIONS\n"
+            "The owner of this chatbot has enabled email notifications for enquiries. "
+            f"An enquiry is defined as: {notify_when}\n\n"
+            "When you detect that a conversation is heading toward an enquiry situation:\n"
+            "1. First, help the user with their question as best you can.\n"
+            "2. When the topic requires human follow-up (pricing quotes, complaints, custom requests, "
+            "demo scheduling, partnership proposals, or anything you cannot fully resolve), "
+            "naturally ask for the visitor\'s **name**, **email address**, and **company name** (if relevant).\n"
+            "3. Be conversational — don\'t dump all questions at once. Ask naturally as the conversation flows.\n"
+            "4. Once you have the contact details, confirm them back to the user and let them know "
+            "the team/owner will follow up.\n"
+            "5. NEVER say you are sending an email or triggering a notification. "
+            "Instead say something like \'I\'ll pass this along to our team\' or "
+            "\'Our team will reach out to you at <email> shortly.\'"
+            "\n"
+        )
 
     if rag_engine and RAG_ENABLED:
         try:
@@ -570,9 +591,8 @@ async def health():
     }
 
 
-async def _check_enquiry_and_notify(user_message: str):
-    """Background task: Ask LLM if user message is an enquiry matching notify_when criteria, and call backend to send email."""
-    # Refresh config from backend every 60 seconds
+async def _refresh_notification_config():
+    """Refresh notification config from backend every 60 seconds."""
     now = time.time()
     if CHATBOT_IDENTIFIER and now - _notification_config["last_refresh"] > 60:
         try:
@@ -589,29 +609,85 @@ async def _check_enquiry_and_notify(user_message: str):
         except Exception as e:
             logger.warning(f"[enquiry] Config refresh failed: {e}")
 
+
+async def _check_enquiry_and_notify(conversation: list[dict]):
+    """Background task: Analyse the full conversation for enquiry + contact details, then notify owner."""
+    await _refresh_notification_config()
+
     if not _notification_config["enabled"] or not CHATBOT_IDENTIFIER or not _notification_config["notify_when"]:
         return
     try:
         notify_when = _notification_config["notify_when"]
+
+        # Build a conversation transcript for the LLM to analyse
+        transcript_lines = []
+        for msg in conversation[-20:]:  # last 20 messages
+            role = msg.get("role", "user")
+            if role in ("user", "assistant"):
+                transcript_lines.append(f"{role.upper()}: {msg.get('content', '')}")
+        transcript = "\n".join(transcript_lines)
+
         classify_prompt = (
-            f"You are classifying user messages. The chatbot owner wants to be notified when: {notify_when}\n\n"
-            f"User message: \"{user_message}\"\n\n"
-            "Does this user message match the notification criteria? Reply with ONLY 'YES' or 'NO'."
+            "You are analysing a chatbot conversation to determine if it contains an enquiry that the "
+            f"business owner should be notified about.\n\n"
+            f"The owner wants to be notified when: {notify_when}\n\n"
+            f"CONVERSATION:\n{transcript}\n\n"
+            "Based on the conversation above, answer in STRICT JSON format (no markdown, no extra text):\n"
+            '{\n'
+            '  "is_enquiry": true or false,\n'
+            '  "customer_name": "extracted name or empty string",\n'
+            '  "customer_email": "extracted email or empty string",\n'
+            '  "customer_company": "extracted company or empty string",\n'
+            '  "summary": "one-line summary of what the customer wants"\n'
+            '}\n\n'
+            "Rules:\n"
+            "- Set is_enquiry to true ONLY if the conversation matches the notification criteria.\n"
+            "- Extract name, email, and company ONLY if the customer explicitly provided them.\n"
+            "- Do NOT guess or invent details. Leave as empty string if not provided.\n"
+            "- The summary should be a brief description of the customer's need."
         )
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{OLLAMA_URL}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": classify_prompt, "stream": False, "options": {"temperature": 0, "num_predict": 10}},
+                json={"model": OLLAMA_MODEL, "prompt": classify_prompt, "stream": False, "options": {"temperature": 0, "num_predict": 300}},
             )
-            answer = resp.json().get("response", "").strip().upper()
+            raw_answer = resp.json().get("response", "").strip()
 
-        if "YES" in answer:
-            logger.info(f"[enquiry] Detected enquiry, notifying owner for chatbot {CHATBOT_IDENTIFIER}")
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                await client.post(
-                    f"{BACKEND_INTERNAL_URL}/api/internal/chatbot-enquiry-email",
-                    json={"chatbot_id": CHATBOT_ID, "base_name": CHATBOT_BASE_NAME, "user_message": user_message[:2000], "secret": INTERNAL_API_SECRET},
-                )
+        # Parse JSON from LLM response
+        # Try to find JSON in the response
+        json_match = re.search(r'\{[^{}]*\}', raw_answer, re.DOTALL)
+        if not json_match:
+            logger.debug(f"[enquiry] No JSON found in LLM response: {raw_answer[:200]}")
+            return
+
+        result = json.loads(json_match.group())
+
+        if not result.get("is_enquiry", False):
+            return
+
+        logger.info(f"[enquiry] Detected enquiry for chatbot {CHATBOT_IDENTIFIER}: {result.get('summary', '')}")
+
+        # Build the latest user message for fallback
+        user_messages = [m.get("content", "") for m in conversation if m.get("role") == "user"]
+        latest_user_msg = user_messages[-1] if user_messages else ""
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            await client.post(
+                f"{BACKEND_INTERNAL_URL}/api/internal/chatbot-enquiry-email",
+                json={
+                    "chatbot_id": CHATBOT_ID,
+                    "base_name": CHATBOT_BASE_NAME,
+                    "user_message": latest_user_msg[:2000],
+                    "customer_name": result.get("customer_name", ""),
+                    "customer_email": result.get("customer_email", ""),
+                    "customer_company": result.get("customer_company", ""),
+                    "enquiry_summary": result.get("summary", ""),
+                    "secret": INTERNAL_API_SECRET,
+                },
+            )
+    except json.JSONDecodeError:
+        logger.warning(f"[enquiry] Failed to parse LLM JSON response")
     except Exception as e:
         logger.warning(f"[enquiry] Notification check failed: {e}")
 
@@ -665,7 +741,8 @@ async def chat(req: ChatRequest):
 
     # ── Fire-and-forget enquiry detection ──
     if CHATBOT_IDENTIFIER and latest_query:
-        asyncio.create_task(_check_enquiry_and_notify(latest_query))
+        conv_snapshot = [{"role": m.role, "content": m.content} for m in req.messages[-MAX_CONTEXT_MESSAGES:]]
+        asyncio.create_task(_check_enquiry_and_notify(conv_snapshot))
 
     # ── Agent mode: auto-research ──
     research_context = ""
@@ -676,7 +753,7 @@ async def chat(req: ChatRequest):
             logger.error(f"[chat] Research failed: {e}", exc_info=True)
 
     # ── Build final system prompt ──
-    system_prompt = _build_system_prompt(latest_query)
+    system_prompt = _build_system_prompt(latest_query, [{"role": m.role, "content": m.content} for m in req.messages])
 
     if research_context:
         system_prompt += "\n\n" + research_context

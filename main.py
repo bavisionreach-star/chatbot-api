@@ -627,50 +627,62 @@ async def _check_enquiry_and_notify(conversation: list[dict]):
                 transcript_lines.append(f"{role.upper()}: {msg.get('content', '')}")
         transcript = "\n".join(transcript_lines)
 
+        # Step 1: Quick classification — is this an enquiry?
         classify_prompt = (
-            "You are analysing a chatbot conversation to determine if it contains an enquiry that the "
-            f"business owner should be notified about.\n\n"
-            f"The owner wants to be notified when: {notify_when}\n\n"
+            "You are classifying chatbot conversations. The chatbot owner wants to be notified when: "
+            f"{notify_when}\n\n"
             f"CONVERSATION:\n{transcript}\n\n"
-            "Based on the conversation above, answer in STRICT JSON format (no markdown, no extra text):\n"
-            '{\n'
-            '  "is_enquiry": true or false,\n'
-            '  "customer_name": "extracted name or empty string",\n'
-            '  "customer_email": "extracted email or empty string",\n'
-            '  "customer_company": "extracted company or empty string",\n'
-            '  "summary": "one-line summary of what the customer wants"\n'
-            '}\n\n'
-            "Rules:\n"
-            "- Set is_enquiry to true ONLY if the conversation matches the notification criteria.\n"
-            "- Extract name, email, and company ONLY if the customer explicitly provided them.\n"
-            "- Do NOT guess or invent details. Leave as empty string if not provided.\n"
-            "- The summary should be a brief description of the customer's need."
+            "Does this conversation match the notification criteria above? Reply with ONLY 'YES' or 'NO'."
         )
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{OLLAMA_URL}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": classify_prompt, "stream": False, "options": {"temperature": 0, "num_predict": 300}},
+                json={"model": OLLAMA_MODEL, "prompt": classify_prompt, "stream": False, "options": {"temperature": 0, "num_predict": 10}},
             )
-            raw_answer = resp.json().get("response", "").strip()
+            answer = resp.json().get("response", "").strip().upper()
 
-        # Parse JSON from LLM response
-        # Try to find JSON in the response
-        json_match = re.search(r'\{[^{}]*\}', raw_answer, re.DOTALL)
-        if not json_match:
-            logger.debug(f"[enquiry] No JSON found in LLM response: {raw_answer[:200]}")
+        if "YES" not in answer:
             return
 
-        result = json.loads(json_match.group())
+        logger.info(f"[enquiry] Detected enquiry for chatbot {CHATBOT_IDENTIFIER}, generating email body")
 
-        if not result.get("is_enquiry", False):
+        # Step 2: Generate a natural email body written as the GPT assistant
+        bot_name = CHATBOT_NAME or "Your AI Assistant"
+        email_prompt = (
+            "You are writing an email to a business owner on behalf of their AI chatbot. "
+            "The chatbot just had a conversation with a potential customer/visitor and detected an enquiry.\n\n"
+            f"The chatbot's name is: {bot_name}\n"
+            f"The owner wants to be notified when: {notify_when}\n\n"
+            f"CONVERSATION:\n{transcript}\n\n"
+            "Write an email body (plain text, not HTML) that the chatbot sends to its owner reporting this enquiry. "
+            "Rules:\n"
+            "- Start with 'Hi Boss,' (keep it short and professional)\n"
+            "- Briefly describe what the customer wanted (1-2 sentences)\n"
+            "- List ALL details the customer provided as bullet points using '•' (Name, Email, Company, Phone, Team size, Interest, etc.)\n"
+            "- If details like name or email were NOT provided by the customer, write 'Not provided' — NEVER invent details\n"
+            "- Add a short note about what follow-up is needed\n"
+            f"- End with 'Yours faithfully,\n{bot_name}'\n"
+            "- Keep it concise and professional — no fluff, no markdown formatting, no subject line\n"
+            "- Do NOT wrap in quotes or add any preamble — output ONLY the email body"
+        )
+
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={"model": OLLAMA_MODEL, "prompt": email_prompt, "stream": False, "options": {"temperature": 0.3, "num_predict": 600}},
+            )
+            email_body = resp.json().get("response", "").strip()
+
+        if not email_body or len(email_body) < 20:
+            logger.warning("[enquiry] LLM generated empty or too-short email body")
             return
 
-        logger.info(f"[enquiry] Detected enquiry for chatbot {CHATBOT_IDENTIFIER}: {result.get('summary', '')}")
-
-        # Build the latest user message for fallback
-        user_messages = [m.get("content", "") for m in conversation if m.get("role") == "user"]
-        latest_user_msg = user_messages[-1] if user_messages else ""
+        # Extract customer name and email from conversation for subject line
+        email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', transcript)
+        customer_email = email_match.group() if email_match else ""
+        name_match = re.search(r"(?:I'm|I am|name is|Name:)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)", transcript)
+        customer_name = name_match.group(1) if name_match else ""
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             await client.post(
@@ -678,16 +690,13 @@ async def _check_enquiry_and_notify(conversation: list[dict]):
                 json={
                     "chatbot_id": CHATBOT_ID,
                     "base_name": CHATBOT_BASE_NAME,
-                    "user_message": latest_user_msg[:2000],
-                    "customer_name": result.get("customer_name", ""),
-                    "customer_email": result.get("customer_email", ""),
-                    "customer_company": result.get("customer_company", ""),
-                    "enquiry_summary": result.get("summary", ""),
+                    "email_body": email_body,
+                    "customer_name": customer_name,
+                    "customer_email": customer_email,
+                    "bot_name": bot_name,
                     "secret": INTERNAL_API_SECRET,
                 },
             )
-    except json.JSONDecodeError:
-        logger.warning(f"[enquiry] Failed to parse LLM JSON response")
     except Exception as e:
         logger.warning(f"[enquiry] Notification check failed: {e}")
 

@@ -85,6 +85,15 @@ _identity_block = (
        if ORG_NAME else
        "If anyone asks who made you or who built you, say you were built using DeepRack by Bavision LLP. "
     )
+    + "\n\n"
+    "## GREETING INSTRUCTIONS\n"
+    "At the very beginning of every conversation (when the first user message arrives), "
+    "greet the user warmly and ask for their name. Example: "
+    f"'Hi there! Welcome! I'm {CHATBOT_NAME}"
+    + (f", {ORG_NAME}'s AI assistant" if ORG_NAME else "")
+    + ". Before we get started, may I know your name?' "
+    "Once they provide their name, use it naturally throughout the conversation. "
+    "If they skip or decline, continue without pressing — never insist."
 )
 
 DEFAULT_BAVISION_PROMPT = (
@@ -534,14 +543,18 @@ def _build_system_prompt(user_query: str, conversation_messages: list = None) ->
             "1. First, help the user with their question as best you can.\n"
             "2. When the topic requires human follow-up (pricing quotes, complaints, custom requests, "
             "demo scheduling, partnership proposals, or anything you cannot fully resolve), "
-            "naturally ask for the visitor\'s **name**, **email address**, and **company name** (if relevant).\n"
+            "naturally ask for the visitor\'s **name** (if not already known), **email address**, and **company name** (if relevant).\n"
             "3. Be conversational — don\'t dump all questions at once. Ask naturally as the conversation flows.\n"
-            "4. Once you have the contact details, confirm them back to the user and let them know "
-            "the team/owner will follow up.\n"
-            "5. Do NOT promise to send an email yourself — the notification system handles that automatically in the background. "
-            "Instead say something like \'I\'ll make sure the team is notified\' or "
-            "\'Let me pass this along to our team — someone will reach out to you shortly.\'"
-            "\n"
+            "4. Once you have enough details, proactively tell the user something like:\n"
+            "   \'I\'ve summarized our conversation and will be notifying the respective team regarding this. "
+            "Is there anything else you\'d like me to include or let them know?\'\n"
+            "5. Wait for the user to confirm or add anything. After their confirmation, say something like:\n"
+            "   \'Great, I\'ll make sure the team is notified with all the details. "
+            "Someone will reach out to you shortly!\'\n"
+            "6. Do NOT promise to send an email yourself — the notification system handles that automatically in the background. "
+            "Use natural language like \'notifying the team\' or \'passing this along\'.\n"
+            "7. If the user mentions additional details after you have offered to notify, include those too "
+            "and confirm again before concluding.\n"
         )
 
     if rag_engine and RAG_ENABLED:

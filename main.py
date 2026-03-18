@@ -605,6 +605,31 @@ async def health():
     }
 
 
+# ── Cached default questions (fetched from backend DB) ──
+_suggestions_cache = {"questions": [], "last_refresh": 0}
+
+
+@app.get("/suggestions")
+async def get_suggestions():
+    """Return starter questions for the chatbot UI. Fetched from backend DB, cached 5 min."""
+    now = time.time()
+    if CHATBOT_IDENTIFIER and now - _suggestions_cache["last_refresh"] > 300:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{BACKEND_INTERNAL_URL}/api/internal/chatbot-suggestions/{CHATBOT_IDENTIFIER}",
+                    headers={"X-Internal-Secret": INTERNAL_API_SECRET},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    _suggestions_cache["questions"] = data.get("default_questions", [])
+                    _suggestions_cache["last_refresh"] = now
+        except Exception as e:
+            logger.warning(f"Failed to fetch suggestions: {e}")
+
+    return {"suggestions": _suggestions_cache["questions"]}
+
+
 async def _refresh_notification_config():
     """Refresh notification config from backend every 60 seconds."""
     now = time.time()

@@ -69,6 +69,7 @@ INTERNAL_API_SECRET = os.getenv("INTERNAL_API_SECRET", "deeprack-internal-2024")
 _notification_config = {
     "enabled": EMAIL_NOTIFICATIONS,
     "notify_when": NOTIFY_WHEN,
+    "owner_email": "",
     "last_refresh": 0,
 }
 
@@ -537,9 +538,9 @@ def _build_system_prompt(user_query: str, conversation_messages: list = None) ->
             "3. Be conversational — don\'t dump all questions at once. Ask naturally as the conversation flows.\n"
             "4. Once you have the contact details, confirm them back to the user and let them know "
             "the team/owner will follow up.\n"
-            "5. NEVER say you are sending an email or triggering a notification. "
-            "Instead say something like \'I\'ll pass this along to our team\' or "
-            "\'Our team will reach out to you at <email> shortly.\'"
+            "5. Do NOT promise to send an email yourself — the notification system handles that automatically in the background. "
+            "Instead say something like \'I\'ll make sure the team is notified\' or "
+            "\'Let me pass this along to our team — someone will reach out to you shortly.\'"
             "\n"
         )
 
@@ -605,17 +606,19 @@ async def _refresh_notification_config():
                     cfg = resp.json()
                     _notification_config["enabled"] = cfg.get("email_notifications", False)
                     _notification_config["notify_when"] = cfg.get("notify_when", "")
+                    _notification_config["owner_email"] = cfg.get("owner_email", "")
                     _notification_config["last_refresh"] = now
         except Exception as e:
             logger.warning(f"[enquiry] Config refresh failed: {e}")
 
 
-async def _check_enquiry_and_notify(conversation: list[dict]):
-    """Background task: Analyse the full conversation for enquiry + contact details, then notify owner."""
+async def _check_enquiry_and_notify(conversation: list[dict]) -> dict:
+    """Analyse the full conversation for enquiry + contact details, then notify owner.
+    Returns {"notified": True/False, "reason": str} so the caller can inform the user."""
     await _refresh_notification_config()
 
     if not _notification_config["enabled"] or not CHATBOT_IDENTIFIER or not _notification_config["notify_when"]:
-        return
+        return {"notified": False, "reason": "disabled"}
     try:
         notify_when = _notification_config["notify_when"]
 
@@ -643,7 +646,7 @@ async def _check_enquiry_and_notify(conversation: list[dict]):
             answer = resp.json().get("response", "").strip().upper()
 
         if "YES" not in answer:
-            return
+            return {"notified": False, "reason": "not_enquiry"}
 
         logger.info(f"[enquiry] Detected enquiry for chatbot {CHATBOT_IDENTIFIER}, generating email body")
 
@@ -676,7 +679,7 @@ async def _check_enquiry_and_notify(conversation: list[dict]):
 
         if not email_body or len(email_body) < 20:
             logger.warning("[enquiry] LLM generated empty or too-short email body")
-            return
+            return {"notified": False, "reason": "empty_body"}
 
         # Extract customer name and email from conversation for subject line
         email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', transcript)
@@ -685,7 +688,7 @@ async def _check_enquiry_and_notify(conversation: list[dict]):
         customer_name = name_match.group(1) if name_match else ""
 
         async with httpx.AsyncClient(timeout=15.0) as client:
-            await client.post(
+            resp = await client.post(
                 f"{BACKEND_INTERNAL_URL}/api/internal/chatbot-enquiry-email",
                 json={
                     "chatbot_id": CHATBOT_ID,
@@ -697,8 +700,41 @@ async def _check_enquiry_and_notify(conversation: list[dict]):
                     "secret": INTERNAL_API_SECRET,
                 },
             )
+            result = resp.json()
+            if result.get("sent"):
+                logger.info(f"[enquiry] Email sent for chatbot {CHATBOT_IDENTIFIER}")
+                return {"notified": True, "reason": "sent"}
+            else:
+                logger.warning(f"[enquiry] Email not sent: {result.get('reason')}")
+                return {"notified": False, "reason": result.get("reason", "backend_rejected")}
     except Exception as e:
         logger.warning(f"[enquiry] Notification check failed: {e}")
+        return {"notified": False, "reason": "error"}
+
+
+def _build_notification_followup(result: dict) -> str:
+    """Build a short follow-up message based on email notification result."""
+    owner_email = _notification_config.get("owner_email", "")
+    bot_name = CHATBOT_NAME or "Your AI Assistant"
+    org = ORG_NAME or "the team"
+
+    if result.get("notified"):
+        return (
+            f"✅ I've notified {org} about your enquiry — "
+            f"someone from the team will get back to you shortly!"
+        )
+    else:
+        # Notification failed — give the user a direct way to reach out
+        if owner_email:
+            return (
+                f"⚠️ I wasn't able to reach {org} right now, "
+                f"but you can contact them directly at **{owner_email}**."
+            )
+        else:
+            return (
+                f"⚠️ I wasn't able to notify {org} at the moment. "
+                f"Please try again later or reach out to them directly."
+            )
 
 
 async def _save_chat_messages(session_id: str, user_msg: str, assistant_msg: str):
@@ -748,10 +784,10 @@ async def chat(req: ChatRequest):
         first_user = user_messages[0].content if user_messages else ""
         session_id = hashlib.sha256(first_user.encode()).hexdigest()[:16]
 
-    # ── Fire-and-forget enquiry detection ──
+    # ── Prepare enquiry snapshot (will be checked after response) ──
+    conv_snapshot = None
     if CHATBOT_IDENTIFIER and latest_query:
         conv_snapshot = [{"role": m.role, "content": m.content} for m in req.messages[-MAX_CONTEXT_MESSAGES:]]
-        asyncio.create_task(_check_enquiry_and_notify(conv_snapshot))
 
     # ── Agent mode: auto-research ──
     research_context = ""
@@ -820,6 +856,22 @@ async def chat(req: ChatRequest):
                 logger.error(f"Chat stream error: {e}")
                 yield '{"error": "Something went wrong. Please try again."}\n'
 
+            # ── Post-response: enquiry detection + email notification ──
+            if conv_snapshot:
+                try:
+                    result = await _check_enquiry_and_notify(conv_snapshot)
+                    if result.get("reason") != "not_enquiry" and result.get("reason") != "disabled":
+                        followup = _build_notification_followup(result)
+                        if followup:
+                            followup_chunk = json.dumps({
+                                "message": {"role": "assistant", "content": "\n\n" + followup},
+                                "done": False,
+                            })
+                            yield followup_chunk + "\n"
+                            collected_response.append("\n\n" + followup)
+                except Exception as e:
+                    logger.warning(f"[enquiry] Post-stream notification failed: {e}")
+
         async def _save_after_stream():
             full_response = "".join(collected_response)
             if latest_query and full_response:
@@ -843,8 +895,20 @@ async def chat(req: ChatRequest):
                     },
                 )
                 data = resp.json()
-                # Save the user + assistant message pair
                 assistant_content = data.get("message", {}).get("content", "")
+
+                # Post-response: enquiry detection + email notification
+                if conv_snapshot:
+                    try:
+                        result = await _check_enquiry_and_notify(conv_snapshot)
+                        if result.get("reason") != "not_enquiry" and result.get("reason") != "disabled":
+                            followup = _build_notification_followup(result)
+                            if followup:
+                                assistant_content += "\n\n" + followup
+                                data["message"]["content"] = assistant_content
+                    except Exception as e:
+                        logger.warning(f"[enquiry] Non-stream notification failed: {e}")
+
                 if latest_query and assistant_content:
                     asyncio.create_task(_save_chat_messages(session_id, latest_query, assistant_content))
                 return data

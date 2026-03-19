@@ -248,7 +248,11 @@ async def _llm_generate(prompt: str, temperature: float = 0, max_tokens: int = 1
                 },
             )
             data = resp.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            msg = data.get("choices", [{}])[0].get("message", {})
+            content = msg.get("content") or ""
+            # Sarvam reasoning model may put answer in reasoning_content
+            if not content.strip():
+                content = msg.get("reasoning_content") or ""
             usage = data.get("usage", {})
             asyncio.create_task(_report_sarvam_usage(
                 usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
@@ -288,7 +292,11 @@ async def _llm_chat_nonstream(messages: list[dict], temperature: float = 0.3, ma
                 },
             )
             data = resp.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            msg = data.get("choices", [{}])[0].get("message", {})
+            content = msg.get("content") or ""
+            # Sarvam reasoning model may put answer in reasoning_content
+            if not content.strip():
+                content = msg.get("reasoning_content") or ""
             usage = data.get("usage", {})
             asyncio.create_task(_report_sarvam_usage(
                 usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),

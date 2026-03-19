@@ -887,6 +887,12 @@ async def _check_enquiry_and_notify(conversation: list[dict]) -> dict:
     if not _notification_config["enabled"] or not CHATBOT_IDENTIFIER or not _notification_config["notify_when"]:
         return {"notified": False, "reason": "disabled"}
     try:
+        # Require at least 3 user messages before checking — let the chatbot
+        # collect details (name, email, requirements) before triggering.
+        user_msg_count = sum(1 for m in conversation if m.get("role") == "user")
+        if user_msg_count < 3:
+            return {"notified": False, "reason": "not_enough_conversation"}
+
         notify_when = _notification_config["notify_when"]
 
         # Build a conversation transcript for the LLM to analyse
@@ -897,12 +903,17 @@ async def _check_enquiry_and_notify(conversation: list[dict]) -> dict:
                 transcript_lines.append(f"{role.upper()}: {msg.get('content', '')}")
         transcript = "\n".join(transcript_lines)
 
-        # Step 1: Quick classification — is this an enquiry?
+        # Step 1: Quick classification — is this an enquiry with enough details?
         classify_prompt = (
             "You are classifying chatbot conversations. The chatbot owner wants to be notified when: "
             f"{notify_when}\n\n"
             f"CONVERSATION:\n{transcript}\n\n"
-            "Does this conversation match the notification criteria above? Reply with ONLY 'YES' or 'NO'."
+            "Answer YES ONLY if ALL of these conditions are met:\n"
+            "1. The conversation matches the notification criteria above\n"
+            "2. The customer has shared their contact details (name AND email or phone number)\n"
+            "3. The chatbot has gathered enough information about what the customer needs\n\n"
+            "If the customer has NOT yet shared their name and contact info, answer NO.\n"
+            "Reply with ONLY 'YES' or 'NO'."
         )
 
         answer = (await _llm_generate(classify_prompt, temperature=0, max_tokens=10)).upper()

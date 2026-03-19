@@ -171,6 +171,11 @@ _user_system_prompt = os.getenv("SYSTEM_PROMPT", "You are a helpful AI assistant
 
 def get_system_prompt():
     """Get the full system prompt = Bavision branding + user prompt."""
+    if _use_sarvam():
+        # For Sarvam, use a concise prompt (the model handles grammar natively;
+        # stuffing thousands of chars of grammar rules wastes the reasoning budget
+        # and makes the model less likely to follow role constraints).
+        return _identity_block.strip() + "\n\n" + _user_system_prompt.strip()
     return DEFAULT_BAVISION_PROMPT.strip() + "\n\n" + _user_system_prompt.strip()
 
 

@@ -1096,6 +1096,7 @@ async def chat(req: ChatRequest):
                     # so use non-streaming and emit the full response as a single chunk.
                     data = await _llm_chat_nonstream(messages, temperature=0.3, max_tokens=4096)
                     content = data.get("message", {}).get("content", "")
+                    logger.info(f"[chat] Sarvam non-stream response: {len(content)} chars")
                     if content:
                         collected_response.append(content)
                         yield json.dumps({"message": {"role": "assistant", "content": content}, "done": False}) + "\n"

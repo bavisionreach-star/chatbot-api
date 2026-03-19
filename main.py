@@ -1145,6 +1145,10 @@ async def chat(req: ChatRequest):
         return StreamingResponse(
             generate(),
             media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
             background=BackgroundTask(_save_after_stream),
         )
     else:

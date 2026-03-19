@@ -43,10 +43,10 @@ CHATBOT_NAME = os.getenv("CHATBOT_NAME", "AI Assistant")
 ORG_NAME = os.getenv("ORG_NAME", "")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "sarvam")   # "sarvam" or "ollama"
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
-SARVAM_MODEL = os.getenv("SARVAM_MODEL", "sarvam-30b")
-SARVAM_API_URL = "https://api.sarvam.ai/v1/chat/completions"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")   # "gemini" or "ollama"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 RAG_ENABLED = os.getenv("RAG_ENABLED", "true").lower() == "true"
 RAG_DATA_DIR = os.getenv("RAG_DATA_DIR", "/workspace/data")
@@ -171,10 +171,9 @@ _user_system_prompt = os.getenv("SYSTEM_PROMPT", "You are a helpful AI assistant
 
 def get_system_prompt():
     """Get the full system prompt = Bavision branding + user prompt."""
-    # For Sarvam, use a concise prompt with the no-code restriction embedded
-    # right after the identity/role. The grammar rules waste reasoning budget
-    # and the model follows role instructions better when they're upfront.
-    if LLM_PROVIDER == "sarvam" and SARVAM_API_KEY:
+    # For Gemini, use a concise prompt with the no-code restriction embedded
+    # right after the identity/role.
+    if LLM_PROVIDER == "gemini" and GEMINI_API_KEY:
         return (
             _identity_block.strip() + "\n\n"
             + _user_system_prompt.strip() + "\n\n"
@@ -192,11 +191,11 @@ SYSTEM_PROMPT = get_system_prompt()
 
 
 # ═══════════════════  LLM ABSTRACTION LAYER  ═══════════════════
-# Wraps Ollama and Sarvam APIs behind a unified interface.
+# Wraps Ollama and Gemini APIs behind a unified interface.
 
-def _use_sarvam():
-    """Check if Sarvam provider should be used."""
-    return LLM_PROVIDER == "sarvam" and SARVAM_API_KEY
+def _use_gemini():
+    """Check if Gemini provider should be used."""
+    return LLM_PROVIDER == "gemini" and GEMINI_API_KEY
 
 
 def _extract_llm_api_key() -> str:
@@ -206,8 +205,8 @@ def _extract_llm_api_key() -> str:
     return parts[1] if len(parts) == 2 else ""
 
 
-async def _report_sarvam_usage(input_tokens: int, output_tokens: int):
-    """Report Sarvam token usage to the backend metered proxy for billing."""
+async def _report_gemini_usage(input_tokens: int, output_tokens: int):
+    """Report Gemini token usage to the backend metered proxy for billing."""
     api_key = _extract_llm_api_key()
     if not api_key or (input_tokens == 0 and output_tokens == 0):
         return
@@ -219,42 +218,37 @@ async def _report_sarvam_usage(input_tokens: int, output_tokens: int):
                 json={
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
-                    "provider": "sarvam",
-                    "model": SARVAM_MODEL,
+                    "provider": "gemini",
+                    "model": GEMINI_MODEL,
                 },
             )
     except Exception as e:
-        logger.warning(f"[billing] Failed to report Sarvam usage: {e}")
+        logger.warning(f"[billing] Failed to report Gemini usage: {e}")
 
 
 async def _llm_generate(prompt: str, temperature: float = 0, max_tokens: int = 10) -> str:
     """Non-streaming text generation. Returns the generated text."""
-    if _use_sarvam():
+    if _use_gemini():
         messages = [{"role": "user", "content": prompt}]
         async with httpx.AsyncClient(timeout=45.0) as client:
             resp = await client.post(
-                SARVAM_API_URL,
+                GEMINI_API_URL,
                 headers={
-                    "api-subscription-key": SARVAM_API_KEY,
+                    "Authorization": f"Bearer {GEMINI_API_KEY}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": SARVAM_MODEL,
+                    "model": GEMINI_MODEL,
                     "messages": messages,
                     "stream": False,
                     "temperature": temperature,
-                    "max_tokens": max_tokens + 500,
-                    "reasoning_effort": "low",
+                    "max_tokens": max_tokens,
                 },
             )
             data = resp.json()
-            msg = data.get("choices", [{}])[0].get("message", {})
-            content = msg.get("content") or ""
-            # Sarvam reasoning model may put answer in reasoning_content
-            if not content.strip():
-                content = msg.get("reasoning_content") or ""
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             usage = data.get("usage", {})
-            asyncio.create_task(_report_sarvam_usage(
+            asyncio.create_task(_report_gemini_usage(
                 usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
             ))
             return (content or "").strip()
@@ -274,31 +268,26 @@ async def _llm_generate(prompt: str, temperature: float = 0, max_tokens: int = 1
 
 async def _llm_chat_nonstream(messages: list[dict], temperature: float = 0.3, max_tokens: int = 4096) -> dict:
     """Non-streaming chat. Returns Ollama-format response dict."""
-    if _use_sarvam():
+    if _use_gemini():
         async with httpx.AsyncClient(timeout=180.0) as client:
             resp = await client.post(
-                SARVAM_API_URL,
+                GEMINI_API_URL,
                 headers={
-                    "api-subscription-key": SARVAM_API_KEY,
+                    "Authorization": f"Bearer {GEMINI_API_KEY}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": SARVAM_MODEL,
+                    "model": GEMINI_MODEL,
                     "messages": messages,
                     "stream": False,
                     "temperature": temperature,
                     "max_tokens": max_tokens,
-                    "reasoning_effort": "low",
                 },
             )
             data = resp.json()
-            msg = data.get("choices", [{}])[0].get("message", {})
-            content = msg.get("content") or ""
-            # Sarvam reasoning model may put answer in reasoning_content
-            if not content.strip():
-                content = msg.get("reasoning_content") or ""
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             usage = data.get("usage", {})
-            asyncio.create_task(_report_sarvam_usage(
+            asyncio.create_task(_report_gemini_usage(
                 usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
             ))
             # Convert to Ollama format for UI compatibility
@@ -322,23 +311,22 @@ async def _llm_chat_nonstream(messages: list[dict], temperature: float = 0.3, ma
 
 async def _llm_chat_stream(messages: list[dict], temperature: float = 0.3, max_tokens: int = 4096):
     """Streaming chat. Yields Ollama-format NDJSON lines."""
-    if _use_sarvam():
+    if _use_gemini():
         stream_usage = {"input": 0, "output": 0}
         async with httpx.AsyncClient(timeout=180.0) as client:
             async with client.stream(
                 "POST",
-                SARVAM_API_URL,
+                GEMINI_API_URL,
                 headers={
-                    "api-subscription-key": SARVAM_API_KEY,
+                    "Authorization": f"Bearer {GEMINI_API_KEY}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": SARVAM_MODEL,
+                    "model": GEMINI_MODEL,
                     "messages": messages,
                     "stream": True,
                     "temperature": temperature,
                     "max_tokens": max_tokens,
-                    "reasoning_effort": "low",
                 },
             ) as response:
                 async for line in response.aiter_lines():
@@ -355,7 +343,6 @@ async def _llm_chat_stream(messages: list[dict], temperature: float = 0.3, max_t
                             stream_usage["output"] = chunk["usage"].get("completion_tokens", 0)
                         delta = chunk.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content")
-                        # Skip reasoning-only chunks (content is null during thinking)
                         if content is None:
                             continue
                         finish = chunk.get("choices", [{}])[0].get("finish_reason")
@@ -369,7 +356,7 @@ async def _llm_chat_stream(messages: list[dict], temperature: float = 0.3, max_t
         # Ensure a final done=true
         yield json.dumps({"message": {"role": "assistant", "content": ""}, "done": True})
         # Report usage for billing
-        asyncio.create_task(_report_sarvam_usage(stream_usage["input"], stream_usage["output"]))
+        asyncio.create_task(_report_gemini_usage(stream_usage["input"], stream_usage["output"]))
     else:
         async with httpx.AsyncClient(timeout=180.0) as client:
             async with client.stream(
@@ -692,7 +679,7 @@ async def lifespan(app: FastAPI):
         logger.info("RAG disabled via RAG_ENABLED=false")
 
     mode = "agent" if IS_AGENT else "chatbot"
-    provider_info = f"Sarvam ({SARVAM_MODEL})" if _use_sarvam() else f"Ollama at {OLLAMA_URL}, model {OLLAMA_MODEL}"
+    provider_info = f"Gemini ({GEMINI_MODEL})" if _use_gemini() else f"Ollama at {OLLAMA_URL}, model {OLLAMA_MODEL}"
     logger.info(
         f"Chatbot '{CHATBOT_NAME}' started — "
         f"mode={mode}, LLM: {provider_info}"
@@ -835,7 +822,7 @@ async def health():
     return {
         "status": "healthy",
         "chatbot_name": CHATBOT_NAME,
-        "model": SARVAM_MODEL if _use_sarvam() else OLLAMA_MODEL,
+        "model": GEMINI_MODEL if _use_gemini() else OLLAMA_MODEL,
         "llm_provider": LLM_PROVIDER,
         "rag_enabled": RAG_ENABLED,
         "rag_documents": rag_engine.document_count() if rag_engine else 0,
@@ -924,13 +911,8 @@ async def _check_enquiry_and_notify(conversation: list[dict]) -> dict:
             "Reply with ONLY 'YES' or 'NO'."
         )
 
-        # Use _llm_chat_nonstream (proven to work with Sarvam reasoning model)
-        classify_resp = await _llm_chat_nonstream(
-            [{"role": "user", "content": classify_prompt}],
-            temperature=0,
-            max_tokens=64,
-        )
-        answer = (classify_resp.get("message", {}).get("content", "")).upper()
+        # Quick YES/NO classification via LLM
+        answer = (await _llm_generate(classify_prompt, temperature=0, max_tokens=10)).upper()
         logger.info(f"[enquiry] Classification answer: {answer!r}")
 
         if "YES" not in answer:
@@ -1111,28 +1093,17 @@ async def chat(req: ChatRequest):
 
         async def generate():
             try:
-                if _use_sarvam():
-                    # Sarvam streaming is unreliable (reasoning consumes all tokens),
-                    # so use non-streaming and emit the full response as a single chunk.
-                    data = await _llm_chat_nonstream(messages, temperature=0.3, max_tokens=4096)
-                    content = data.get("message", {}).get("content", "")
-                    logger.info(f"[chat] Sarvam non-stream response: {len(content)} chars")
-                    if content:
-                        collected_response.append(content)
-                        yield json.dumps({"message": {"role": "assistant", "content": content}, "done": False}) + "\n"
-                    yield json.dumps({"message": {"role": "assistant", "content": ""}, "done": True}) + "\n"
-                else:
-                    async for line in _llm_chat_stream(messages, temperature=0.3, max_tokens=4096):
-                        if line.strip():
-                            # Collect assistant content for saving
-                            try:
-                                chunk = json.loads(line)
-                                content = chunk.get("message", {}).get("content", "")
-                                if content:
-                                    collected_response.append(content)
-                            except Exception:
-                                pass
-                            yield line + "\n"
+                async for line in _llm_chat_stream(messages, temperature=0.3, max_tokens=4096):
+                    if line.strip():
+                        # Collect assistant content for saving
+                        try:
+                            chunk = json.loads(line)
+                            content = chunk.get("message", {}).get("content", "")
+                            if content:
+                                collected_response.append(content)
+                        except Exception:
+                            pass
+                        yield line + "\n"
             except httpx.ConnectError:
                 yield (
                     '{"error": "AI model is starting up. Please try again in a moment."}\n'

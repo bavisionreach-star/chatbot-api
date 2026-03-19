@@ -77,6 +77,9 @@ _notification_config = {
     "last_refresh": 0,
 }
 
+# Track sessions that already have a ticket — avoid re-classifying on every message
+_session_tickets: dict[str, str] = {}  # session_id -> ticket_number
+
 _identity_block = (
     f"You are an AI assistant{f' for {ORG_NAME}' if ORG_NAME else ''}. "
     f"Your name is {CHATBOT_NAME}. "
@@ -874,31 +877,107 @@ async def _refresh_notification_config():
             logger.warning(f"[enquiry] Config refresh failed: {e}")
 
 
-async def _check_enquiry_and_notify(conversation: list[dict]) -> dict:
+async def _check_enquiry_and_notify(conversation: list[dict], session_id: str = "") -> dict:
     """Analyse the full conversation for enquiry + contact details, then notify owner.
-    Returns {"notified": True/False, "reason": str} so the caller can inform the user."""
+    Uses service tickets to prevent duplicate emails. Returns ticket info so the caller can inform the user."""
     await _refresh_notification_config()
 
     if not _notification_config["enabled"] or not CHATBOT_IDENTIFIER or not _notification_config["notify_when"]:
         return {"notified": False, "reason": "disabled"}
+
     try:
-        # Require at least 3 user messages before checking — let the chatbot
-        # collect details (name, email, requirements) before triggering.
+        # Require at least 3 user messages before checking
         user_msg_count = sum(1 for m in conversation if m.get("role") == "user")
         if user_msg_count < 3:
             return {"notified": False, "reason": "not_enough_conversation"}
 
+        # If this session already has a ticket, check for genuine follow-up info
+        has_existing_ticket = session_id and session_id in _session_tickets
+        existing_ticket_number = _session_tickets.get(session_id, "") if has_existing_ticket else ""
+
         notify_when = _notification_config["notify_when"]
 
-        # Build a conversation transcript for the LLM to analyse
+        # Build conversation transcript for the LLM
         transcript_lines = []
-        for msg in conversation[-20:]:  # last 20 messages
+        for msg in conversation[-20:]:
             role = msg.get("role", "user")
             if role in ("user", "assistant"):
                 transcript_lines.append(f"{role.upper()}: {msg.get('content', '')}")
         transcript = "\n".join(transcript_lines)
 
-        # Step 1: Quick classification — is this an enquiry with enough details?
+        if has_existing_ticket:
+            # ── Follow-up check: does the latest message contain genuinely NEW info? ──
+            last_user_msg = ""
+            for msg in reversed(conversation):
+                if msg.get("role") == "user":
+                    last_user_msg = msg.get("content", "")
+                    break
+
+            followup_prompt = (
+                "You are analysing a chatbot conversation. A service ticket has already been created "
+                f"(ticket {existing_ticket_number}) for this customer's enquiry.\n\n"
+                f"The customer's LATEST message is:\n\"{last_user_msg}\"\n\n"
+                "Does this latest message contain SUBSTANTIAL NEW information that should be forwarded "
+                "to the team? Examples of NEW info: additional requirements, changed specifications, "
+                "new contact details, urgent updates, corrections.\n\n"
+                "Examples that are NOT new info: 'thanks', 'ok', 'great', 'sure', 'no problem', "
+                "'that's all', 'bye', general pleasantries, or questions to the assistant.\n\n"
+                "Reply with ONLY 'YES' or 'NO'."
+            )
+            answer = (await _llm_generate(followup_prompt, temperature=0, max_tokens=10)).upper()
+            logger.info(f"[enquiry] Follow-up check for {existing_ticket_number}: {answer!r}")
+
+            if "YES" not in answer:
+                return {"notified": False, "reason": "no_new_info", "ticket_number": existing_ticket_number}
+
+            # Has new info — send as follow-up
+            logger.info(f"[enquiry] Sending follow-up for ticket {existing_ticket_number}")
+
+            # Extract contact details
+            email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', transcript)
+            customer_email = email_match.group() if email_match else ""
+            name_match = re.search(r"(?:I'm|I am|name is|Name:|name:|My name is)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)", transcript)
+            customer_name = name_match.group(1) if name_match else ""
+            phone_match = re.search(r'[\+]?[\d\s\-]{7,15}', transcript)
+            customer_phone = phone_match.group().strip() if phone_match else ""
+
+            bot_name = CHATBOT_NAME or "Your AI Assistant"
+            user_messages = [m.get("content", "") for m in conversation if m.get("role") == "user"]
+            followup_body = (
+                f"Hi,\n\n"
+                f"The customer provided additional information via {bot_name}.\n\n"
+                f"Customer: {customer_name or 'Unknown'}\n"
+                f"Email: {customer_email or 'Not provided'}\n\n"
+                f"New information:\n  {user_messages[-1] if user_messages else ''}\n\n"
+                f"Yours faithfully,\n{bot_name}"
+            )
+
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{BACKEND_INTERNAL_URL}/api/internal/chatbot-enquiry-email",
+                    json={
+                        "chatbot_id": CHATBOT_ID,
+                        "base_name": CHATBOT_BASE_NAME,
+                        "email_body": followup_body,
+                        "customer_name": customer_name,
+                        "customer_email": customer_email,
+                        "customer_phone": customer_phone,
+                        "bot_name": bot_name,
+                        "session_id": session_id,
+                        "is_followup": True,
+                        "secret": INTERNAL_API_SECRET,
+                    },
+                )
+                result = resp.json()
+                ticket_num = result.get("ticket_number", existing_ticket_number)
+                if result.get("sent"):
+                    logger.info(f"[enquiry] Follow-up email sent for {ticket_num}")
+                    return {"notified": True, "reason": "followup_sent", "ticket_number": ticket_num}
+                else:
+                    logger.warning(f"[enquiry] Follow-up not sent: {result.get('reason')}")
+                    return {"notified": False, "reason": result.get("reason", "backend_rejected"), "ticket_number": ticket_num}
+
+        # ── First-time classification: is this an enquiry? ──
         classify_prompt = (
             "You are classifying chatbot conversations. The chatbot owner wants to be notified when: "
             f"{notify_when}\n\n"
@@ -911,48 +990,38 @@ async def _check_enquiry_and_notify(conversation: list[dict]) -> dict:
             "Reply with ONLY 'YES' or 'NO'."
         )
 
-        # Quick YES/NO classification via LLM
         answer = (await _llm_generate(classify_prompt, temperature=0, max_tokens=10)).upper()
         logger.info(f"[enquiry] Classification answer: {answer!r}")
 
         if "YES" not in answer:
             return {"notified": False, "reason": "not_enquiry"}
 
-        logger.info(f"[enquiry] Detected enquiry for chatbot {CHATBOT_IDENTIFIER}, generating email body")
+        logger.info(f"[enquiry] Detected enquiry for chatbot {CHATBOT_IDENTIFIER}, sending notification")
 
-        # Step 2: Build email body from conversation (no extra LLM call)
+        # Extract customer details from conversation
         bot_name = CHATBOT_NAME or "Your AI Assistant"
-
-        # Extract customer name, email, and phone from conversation
         email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', transcript)
-        customer_email = email_match.group() if email_match else "Not provided"
+        customer_email = email_match.group() if email_match else ""
         name_match = re.search(r"(?:I'm|I am|name is|Name:|name:|My name is)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)", transcript)
-        customer_name = name_match.group(1) if name_match else "Not provided"
+        customer_name = name_match.group(1) if name_match else ""
         phone_match = re.search(r'[\+]?[\d\s\-]{7,15}', transcript)
-        customer_phone = phone_match.group().strip() if phone_match else "Not provided"
+        customer_phone = phone_match.group().strip() if phone_match else ""
 
-        # Extract what the user is looking for from their messages
         user_messages = [m.get("content", "") for m in conversation if m.get("role") == "user"]
-        user_requirement = " | ".join(user_messages[-3:])  # last 3 user messages as brief context
+        user_requirement = " | ".join(user_messages[-3:])
 
         email_body = (
             f"Hi,\n\n"
             f"A new enquiry was received via {bot_name}.\n\n"
             f"Customer Details:\n"
-            f"  • Name: {customer_name}\n"
-            f"  • Email: {customer_email}\n"
-            f"  • Phone: {customer_phone}\n\n"
+            f"  • Name: {customer_name or 'Not provided'}\n"
+            f"  • Email: {customer_email or 'Not provided'}\n"
+            f"  • Phone: {customer_phone or 'Not provided'}\n\n"
             f"What they're looking for:\n"
             f"  {user_requirement}\n\n"
             f"You can view the full conversation on the DeepRack platform.\n\n"
             f"Yours faithfully,\n{bot_name}"
         )
-
-        # Reset to empty string if "Not provided" for subject line usage
-        if customer_email == "Not provided":
-            customer_email = ""
-        if customer_name == "Not provided":
-            customer_name = ""
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
@@ -963,14 +1032,27 @@ async def _check_enquiry_and_notify(conversation: list[dict]) -> dict:
                     "email_body": email_body,
                     "customer_name": customer_name,
                     "customer_email": customer_email,
+                    "customer_phone": customer_phone,
                     "bot_name": bot_name,
+                    "session_id": session_id,
                     "secret": INTERNAL_API_SECRET,
                 },
             )
             result = resp.json()
+            ticket_number = result.get("ticket_number", "")
+
             if result.get("sent"):
-                logger.info(f"[enquiry] Email sent for chatbot {CHATBOT_IDENTIFIER}")
-                return {"notified": True, "reason": "sent"}
+                # Cache the ticket number for this session
+                if session_id and ticket_number:
+                    _session_tickets[session_id] = ticket_number
+                logger.info(f"[enquiry] Email sent, ticket {ticket_number}")
+                return {"notified": True, "reason": "sent", "ticket_number": ticket_number}
+            elif result.get("reason") == "ticket_exists":
+                # Backend says ticket already exists — cache it locally too
+                ticket_number = result.get("ticket_number", "")
+                if session_id and ticket_number:
+                    _session_tickets[session_id] = ticket_number
+                return {"notified": False, "reason": "ticket_exists", "ticket_number": ticket_number}
             else:
                 logger.warning(f"[enquiry] Email not sent: {result.get('reason')}")
                 return {"notified": False, "reason": result.get("reason", "backend_rejected")}
@@ -984,13 +1066,35 @@ def _build_notification_followup(result: dict) -> str:
     owner_email = _notification_config.get("owner_email", "")
     bot_name = CHATBOT_NAME or "Your AI Assistant"
     org = ORG_NAME or "the team"
+    ticket_number = result.get("ticket_number", "")
 
     if result.get("notified"):
-        return (
-            f"✅ I've notified {org} about your enquiry — "
-            f"someone from the team will get back to you shortly!"
-        )
+        reason = result.get("reason", "sent")
+        if reason == "followup_sent" and ticket_number:
+            return (
+                f"📩 Your additional details have been forwarded to {org} "
+                f"under ticket **{ticket_number}**. The team will review the update shortly!"
+            )
+        elif ticket_number:
+            return (
+                f"✅ Your service ticket **{ticket_number}** has been created! "
+                f"I've notified {org} — someone from the team will get back to you shortly!"
+            )
+        else:
+            return (
+                f"✅ I've notified {org} about your enquiry — "
+                f"someone from the team will get back to you shortly!"
+            )
     else:
+        reason = result.get("reason", "")
+        if reason == "ticket_exists" and ticket_number:
+            return (
+                f"Your enquiry is already being tracked under ticket **{ticket_number}**. "
+                f"Someone from {org} will reach out to you shortly!"
+            )
+        elif reason == "no_new_info" and ticket_number:
+            # User said something like "thanks" — no need to show anything
+            return ""
         # Notification failed — give the user a direct way to reach out
         if owner_email:
             return (
@@ -1115,8 +1219,8 @@ async def chat(req: ChatRequest):
             # ── Post-response: enquiry detection + email notification ──
             if conv_snapshot:
                 try:
-                    result = await _check_enquiry_and_notify(conv_snapshot)
-                    if result.get("reason") not in ("not_enquiry", "disabled", "not_enough_conversation"):
+                    result = await _check_enquiry_and_notify(conv_snapshot, session_id=session_id)
+                    if result.get("reason") not in ("not_enquiry", "disabled", "not_enough_conversation", "no_new_info"):
                         followup = _build_notification_followup(result)
                         if followup:
                             followup_chunk = json.dumps({
@@ -1150,8 +1254,8 @@ async def chat(req: ChatRequest):
             # Post-response: enquiry detection + email notification
             if conv_snapshot:
                 try:
-                    result = await _check_enquiry_and_notify(conv_snapshot)
-                    if result.get("reason") not in ("not_enquiry", "disabled", "not_enough_conversation"):
+                    result = await _check_enquiry_and_notify(conv_snapshot, session_id=session_id)
+                    if result.get("reason") not in ("not_enquiry", "disabled", "not_enough_conversation", "no_new_info"):
                         followup = _build_notification_followup(result)
                         if followup:
                             assistant_content += "\n\n" + followup

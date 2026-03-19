@@ -171,11 +171,20 @@ _user_system_prompt = os.getenv("SYSTEM_PROMPT", "You are a helpful AI assistant
 
 def get_system_prompt():
     """Get the full system prompt = Bavision branding + user prompt."""
-    # For Sarvam, use a concise prompt (the model handles grammar natively;
-    # stuffing thousands of chars of grammar rules wastes the reasoning budget
-    # and makes the model less likely to follow role constraints).
+    # For Sarvam, use a concise prompt with the no-code restriction embedded
+    # right after the identity/role. The grammar rules waste reasoning budget
+    # and the model follows role instructions better when they're upfront.
     if LLM_PROVIDER == "sarvam" and SARVAM_API_KEY:
-        return _identity_block.strip() + "\n\n" + _user_system_prompt.strip()
+        return (
+            _identity_block.strip() + "\n\n"
+            + _user_system_prompt.strip() + "\n\n"
+            "CRITICAL RULES:\n"
+            "- You are ONLY a support assistant. You handle enquiries, collect information, and pass requests to the team.\n"
+            "- NEVER write code, provide code snippets, give technical implementations, or debug errors. This is strictly forbidden.\n"
+            "- If someone asks you to write code or build something, say: \"I'm a support assistant and I can't write code. "
+            "Let me collect your requirements and pass them to our technical team.\"\n"
+            "- Collect the user's name, email, and details of their request, then confirm you will forward it to the team.\n"
+        )
     return DEFAULT_BAVISION_PROMPT.strip() + "\n\n" + _user_system_prompt.strip()
 
 

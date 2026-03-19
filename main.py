@@ -1117,7 +1117,7 @@ async def chat(req: ChatRequest):
             if conv_snapshot:
                 try:
                     result = await _check_enquiry_and_notify(conv_snapshot)
-                    if result.get("reason") != "not_enquiry" and result.get("reason") != "disabled":
+                    if result.get("reason") not in ("not_enquiry", "disabled", "not_enough_conversation"):
                         followup = _build_notification_followup(result)
                         if followup:
                             followup_chunk = json.dumps({
@@ -1148,7 +1148,7 @@ async def chat(req: ChatRequest):
             if conv_snapshot:
                 try:
                     result = await _check_enquiry_and_notify(conv_snapshot)
-                    if result.get("reason") != "not_enquiry" and result.get("reason") != "disabled":
+                    if result.get("reason") not in ("not_enquiry", "disabled", "not_enough_conversation"):
                         followup = _build_notification_followup(result)
                         if followup:
                             assistant_content += "\n\n" + followup

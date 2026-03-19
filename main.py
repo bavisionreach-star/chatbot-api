@@ -185,6 +185,34 @@ def _use_sarvam():
     return LLM_PROVIDER == "sarvam" and SARVAM_API_KEY
 
 
+def _extract_llm_api_key() -> str:
+    """Extract the LLM API key from the OLLAMA_URL (metered proxy URL)."""
+    # OLLAMA_URL looks like https://api.deeprack.in/api/llm/{api_key}
+    parts = OLLAMA_URL.rstrip("/").split("/api/llm/")
+    return parts[1] if len(parts) == 2 else ""
+
+
+async def _report_sarvam_usage(input_tokens: int, output_tokens: int):
+    """Report Sarvam token usage to the backend metered proxy for billing."""
+    api_key = _extract_llm_api_key()
+    if not api_key or (input_tokens == 0 and output_tokens == 0):
+        return
+    try:
+        base_url = OLLAMA_URL.split("/api/llm/")[0]
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{base_url}/api/llm/{api_key}/api/usage",
+                json={
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "provider": "sarvam",
+                    "model": SARVAM_MODEL,
+                },
+            )
+    except Exception as e:
+        logger.warning(f"[billing] Failed to report Sarvam usage: {e}")
+
+
 async def _llm_generate(prompt: str, temperature: float = 0, max_tokens: int = 10) -> str:
     """Non-streaming text generation. Returns the generated text."""
     if _use_sarvam():
@@ -201,11 +229,16 @@ async def _llm_generate(prompt: str, temperature: float = 0, max_tokens: int = 1
                     "messages": messages,
                     "stream": False,
                     "temperature": temperature,
-                    "max_tokens": max_tokens + 500,  # extra budget for reasoning tokens
+                    "max_tokens": max_tokens + 500,
+                    "reasoning_effort": "low",
                 },
             )
             data = resp.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            usage = data.get("usage", {})
+            asyncio.create_task(_report_sarvam_usage(
+                usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
+            ))
             return (content or "").strip()
     else:
         async with httpx.AsyncClient(timeout=45.0) as client:
@@ -237,10 +270,15 @@ async def _llm_chat_nonstream(messages: list[dict], temperature: float = 0.3, ma
                     "stream": False,
                     "temperature": temperature,
                     "max_tokens": max_tokens,
+                    "reasoning_effort": "low",
                 },
             )
             data = resp.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            usage = data.get("usage", {})
+            asyncio.create_task(_report_sarvam_usage(
+                usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
+            ))
             # Convert to Ollama format for UI compatibility
             return {
                 "message": {"role": "assistant", "content": content or ""},
@@ -263,6 +301,7 @@ async def _llm_chat_nonstream(messages: list[dict], temperature: float = 0.3, ma
 async def _llm_chat_stream(messages: list[dict], temperature: float = 0.3, max_tokens: int = 4096):
     """Streaming chat. Yields Ollama-format NDJSON lines."""
     if _use_sarvam():
+        stream_usage = {"input": 0, "output": 0}
         async with httpx.AsyncClient(timeout=180.0) as client:
             async with client.stream(
                 "POST",
@@ -277,6 +316,7 @@ async def _llm_chat_stream(messages: list[dict], temperature: float = 0.3, max_t
                     "stream": True,
                     "temperature": temperature,
                     "max_tokens": max_tokens,
+                    "reasoning_effort": "low",
                 },
             ) as response:
                 async for line in response.aiter_lines():
@@ -287,6 +327,10 @@ async def _llm_chat_stream(messages: list[dict], temperature: float = 0.3, max_t
                         line = line[6:]
                     try:
                         chunk = json.loads(line)
+                        # Capture usage from the final chunk if present
+                        if "usage" in chunk:
+                            stream_usage["input"] = chunk["usage"].get("prompt_tokens", 0)
+                            stream_usage["output"] = chunk["usage"].get("completion_tokens", 0)
                         delta = chunk.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content")
                         # Skip reasoning-only chunks (content is null during thinking)
@@ -302,6 +346,8 @@ async def _llm_chat_stream(messages: list[dict], temperature: float = 0.3, max_t
                         pass
         # Ensure a final done=true
         yield json.dumps({"message": {"role": "assistant", "content": ""}, "done": True})
+        # Report usage for billing
+        asyncio.create_task(_report_sarvam_usage(stream_usage["input"], stream_usage["output"]))
     else:
         async with httpx.AsyncClient(timeout=180.0) as client:
             async with client.stream(
@@ -680,6 +726,15 @@ def _build_system_prompt(user_query: str, conversation_messages: list = None) ->
     """Build the full system prompt, optionally with RAG context and notification instructions."""
     base = SYSTEM_PROMPT
 
+    # Scope restriction: stick to the role defined in the system prompt
+    base += (
+        "\n\n## IMPORTANT BEHAVIOURAL RULES\n"
+        "- You MUST strictly follow the role described above. Do NOT deviate from it.\n"
+        "- Do NOT write code, give implementation details, debug errors, or act as a developer/consultant.\n"
+        "- If a user asks for something outside your role, politely explain that your role is limited "
+        "and offer to collect their request so the appropriate team can follow up.\n"
+    )
+
     # Inject notification-aware behaviour when email notifications are enabled
     if _notification_config["enabled"] and _notification_config["notify_when"]:
         notify_when = _notification_config["notify_when"]
@@ -703,6 +758,14 @@ def _build_system_prompt(user_query: str, conversation_messages: list = None) ->
             "Use natural language like \'notifying the team\' or \'passing this along\'.\n"
             "7. If the user mentions additional details after you have offered to notify, include those too "
             "and confirm again before concluding.\n"
+        )
+    else:
+        # No email notifications — still collect requests but don't promise notifications
+        base += (
+            "\n\n## HANDLING REQUESTS BEYOND YOUR SCOPE\n"
+            "If a user makes a request that requires human assistance or falls outside your capabilities, "
+            "acknowledge their request, let them know you've taken note of it, and reassure them that "
+            "someone from the team will follow up. Collect their name and email if appropriate.\n"
         )
 
     if rag_engine and RAG_ENABLED:

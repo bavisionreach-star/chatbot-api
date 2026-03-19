@@ -923,37 +923,34 @@ async def _check_enquiry_and_notify(conversation: list[dict]) -> dict:
 
         logger.info(f"[enquiry] Detected enquiry for chatbot {CHATBOT_IDENTIFIER}, generating email body")
 
-        # Step 2: Generate a natural email body written as the GPT assistant
+        # Step 2: Build email body from conversation (no extra LLM call)
         bot_name = CHATBOT_NAME or "Your AI Assistant"
-        email_prompt = (
-            "You are writing an email to a business owner on behalf of their AI chatbot. "
-            "The chatbot just had a conversation with a potential customer/visitor and detected an enquiry.\n\n"
-            f"The chatbot's name is: {bot_name}\n"
-            f"The owner wants to be notified when: {notify_when}\n\n"
-            f"CONVERSATION:\n{transcript}\n\n"
-            "Write an email body (plain text, not HTML) that the chatbot sends to its owner reporting this enquiry. "
-            "Rules:\n"
-            "- Start with 'Hi Boss,' (keep it short and professional)\n"
-            "- Briefly describe what the customer wanted (1-2 sentences)\n"
-            "- List ALL details the customer provided as bullet points using '•' (Name, Email, Company, Phone, Team size, Interest, etc.)\n"
-            "- If details like name or email were NOT provided by the customer, write 'Not provided' — NEVER invent details\n"
-            "- Add a short note about what follow-up is needed\n"
-            f"- End with 'Yours faithfully,\n{bot_name}'\n"
-            "- Keep it concise and professional — no fluff, no markdown formatting, no subject line\n"
-            "- Do NOT wrap in quotes or add any preamble — output ONLY the email body"
+
+        # Extract customer name and email from conversation
+        email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', transcript)
+        customer_email = email_match.group() if email_match else "Not provided"
+        name_match = re.search(r"(?:I'm|I am|name is|Name:|name:|My name is)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)", transcript)
+        customer_name = name_match.group(1) if name_match else "Not provided"
+
+        email_body = (
+            f"Hi Boss,\n\n"
+            f"A visitor just had a conversation with {bot_name} and showed interest.\n\n"
+            f"Customer Details:\n"
+            f"  • Name: {customer_name}\n"
+            f"  • Email: {customer_email}\n\n"
+            f"Conversation Summary:\n"
+            f"{'─' * 40}\n"
+            f"{transcript}\n"
+            f"{'─' * 40}\n\n"
+            f"Please follow up with them at your earliest convenience.\n\n"
+            f"Yours faithfully,\n{bot_name}"
         )
 
-        email_body = await _llm_generate(email_prompt, temperature=0.3, max_tokens=600)
-
-        if not email_body or len(email_body) < 20:
-            logger.warning("[enquiry] LLM generated empty or too-short email body")
-            return {"notified": False, "reason": "empty_body"}
-
-        # Extract customer name and email from conversation for subject line
-        email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', transcript)
-        customer_email = email_match.group() if email_match else ""
-        name_match = re.search(r"(?:I'm|I am|name is|Name:)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)", transcript)
-        customer_name = name_match.group(1) if name_match else ""
+        # Reset to empty string if "Not provided" for subject line usage
+        if customer_email == "Not provided":
+            customer_email = ""
+        if customer_name == "Not provided":
+            customer_name = ""
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(

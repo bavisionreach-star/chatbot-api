@@ -1053,21 +1053,21 @@ async def chat(req: ChatRequest):
             data = await _llm_chat_nonstream(messages, temperature=0.3, max_tokens=4096)
             assistant_content = data.get("message", {}).get("content", "")
 
-                # Post-response: enquiry detection + email notification
-                if conv_snapshot:
-                    try:
-                        result = await _check_enquiry_and_notify(conv_snapshot)
-                        if result.get("reason") != "not_enquiry" and result.get("reason") != "disabled":
-                            followup = _build_notification_followup(result)
-                            if followup:
-                                assistant_content += "\n\n" + followup
-                                data["message"]["content"] = assistant_content
-                    except Exception as e:
-                        logger.warning(f"[enquiry] Non-stream notification failed: {e}")
+            # Post-response: enquiry detection + email notification
+            if conv_snapshot:
+                try:
+                    result = await _check_enquiry_and_notify(conv_snapshot)
+                    if result.get("reason") != "not_enquiry" and result.get("reason") != "disabled":
+                        followup = _build_notification_followup(result)
+                        if followup:
+                            assistant_content += "\n\n" + followup
+                            data["message"]["content"] = assistant_content
+                except Exception as e:
+                    logger.warning(f"[enquiry] Non-stream notification failed: {e}")
 
-                if latest_query and assistant_content:
-                    asyncio.create_task(_save_chat_messages(session_id, latest_query, assistant_content))
-                return data
+            if latest_query and assistant_content:
+                asyncio.create_task(_save_chat_messages(session_id, latest_query, assistant_content))
+            return data
         except httpx.ConnectError:
             raise HTTPException(503, "AI model is currently unavailable.")
         except Exception as e:

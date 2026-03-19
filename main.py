@@ -916,7 +916,14 @@ async def _check_enquiry_and_notify(conversation: list[dict]) -> dict:
             "Reply with ONLY 'YES' or 'NO'."
         )
 
-        answer = (await _llm_generate(classify_prompt, temperature=0, max_tokens=10)).upper()
+        # Use _llm_chat_nonstream (proven to work with Sarvam reasoning model)
+        classify_resp = await _llm_chat_nonstream(
+            [{"role": "user", "content": classify_prompt}],
+            temperature=0,
+            max_tokens=64,
+        )
+        answer = (classify_resp.get("message", {}).get("content", "")).upper()
+        logger.info(f"[enquiry] Classification answer: {answer!r}")
 
         if "YES" not in answer:
             return {"notified": False, "reason": "not_enquiry"}
@@ -926,23 +933,28 @@ async def _check_enquiry_and_notify(conversation: list[dict]) -> dict:
         # Step 2: Build email body from conversation (no extra LLM call)
         bot_name = CHATBOT_NAME or "Your AI Assistant"
 
-        # Extract customer name and email from conversation
+        # Extract customer name, email, and phone from conversation
         email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', transcript)
         customer_email = email_match.group() if email_match else "Not provided"
         name_match = re.search(r"(?:I'm|I am|name is|Name:|name:|My name is)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)", transcript)
         customer_name = name_match.group(1) if name_match else "Not provided"
+        phone_match = re.search(r'[\+]?[\d\s\-]{7,15}', transcript)
+        customer_phone = phone_match.group().strip() if phone_match else "Not provided"
+
+        # Extract what the user is looking for from their messages
+        user_messages = [m.get("content", "") for m in conversation if m.get("role") == "user"]
+        user_requirement = " | ".join(user_messages[-3:])  # last 3 user messages as brief context
 
         email_body = (
-            f"Hi Boss,\n\n"
-            f"A visitor just had a conversation with {bot_name} and showed interest.\n\n"
+            f"Hi,\n\n"
+            f"A new enquiry was received via {bot_name}.\n\n"
             f"Customer Details:\n"
             f"  • Name: {customer_name}\n"
-            f"  • Email: {customer_email}\n\n"
-            f"Conversation Summary:\n"
-            f"{'─' * 40}\n"
-            f"{transcript}\n"
-            f"{'─' * 40}\n\n"
-            f"Please follow up with them at your earliest convenience.\n\n"
+            f"  • Email: {customer_email}\n"
+            f"  • Phone: {customer_phone}\n\n"
+            f"What they're looking for:\n"
+            f"  {user_requirement}\n\n"
+            f"You can view the full conversation on the DeepRack platform.\n\n"
             f"Yours faithfully,\n{bot_name}"
         )
 

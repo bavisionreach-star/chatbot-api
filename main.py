@@ -43,6 +43,10 @@ CHATBOT_NAME = os.getenv("CHATBOT_NAME", "AI Assistant")
 ORG_NAME = os.getenv("ORG_NAME", "")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "sarvam")   # "sarvam" or "ollama"
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
+SARVAM_MODEL = os.getenv("SARVAM_MODEL", "sarvam-30b")
+SARVAM_API_URL = "https://api.sarvam.ai/v1/chat/completions"
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 RAG_ENABLED = os.getenv("RAG_ENABLED", "true").lower() == "true"
 RAG_DATA_DIR = os.getenv("RAG_DATA_DIR", "/workspace/data")
@@ -171,6 +175,149 @@ def get_system_prompt():
 
 
 SYSTEM_PROMPT = get_system_prompt()
+
+
+# ═══════════════════  LLM ABSTRACTION LAYER  ═══════════════════
+# Wraps Ollama and Sarvam APIs behind a unified interface.
+
+def _use_sarvam():
+    """Check if Sarvam provider should be used."""
+    return LLM_PROVIDER == "sarvam" and SARVAM_API_KEY
+
+
+async def _llm_generate(prompt: str, temperature: float = 0, max_tokens: int = 10) -> str:
+    """Non-streaming text generation. Returns the generated text."""
+    if _use_sarvam():
+        messages = [{"role": "user", "content": prompt}]
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                SARVAM_API_URL,
+                headers={
+                    "api-subscription-key": SARVAM_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": SARVAM_MODEL,
+                    "messages": messages,
+                    "stream": False,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens + 500,  # extra budget for reasoning tokens
+                },
+            )
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return (content or "").strip()
+    else:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": temperature, "num_predict": max_tokens},
+                },
+            )
+            return resp.json().get("response", "").strip()
+
+
+async def _llm_chat_nonstream(messages: list[dict], temperature: float = 0.3, max_tokens: int = 4096) -> dict:
+    """Non-streaming chat. Returns Ollama-format response dict."""
+    if _use_sarvam():
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(
+                SARVAM_API_URL,
+                headers={
+                    "api-subscription-key": SARVAM_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": SARVAM_MODEL,
+                    "messages": messages,
+                    "stream": False,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                },
+            )
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            # Convert to Ollama format for UI compatibility
+            return {
+                "message": {"role": "assistant", "content": content or ""},
+                "done": True,
+            }
+    else:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(
+                f"{OLLAMA_URL}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {"temperature": temperature, "num_predict": max_tokens},
+                },
+            )
+            return resp.json()
+
+
+async def _llm_chat_stream(messages: list[dict], temperature: float = 0.3, max_tokens: int = 4096):
+    """Streaming chat. Yields Ollama-format NDJSON lines."""
+    if _use_sarvam():
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            async with client.stream(
+                "POST",
+                SARVAM_API_URL,
+                headers={
+                    "api-subscription-key": SARVAM_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": SARVAM_MODEL,
+                    "messages": messages,
+                    "stream": True,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                },
+            ) as response:
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line or line == "data: [DONE]":
+                        continue
+                    if line.startswith("data: "):
+                        line = line[6:]
+                    try:
+                        chunk = json.loads(line)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content")
+                        # Skip reasoning-only chunks (content is null during thinking)
+                        if content is None:
+                            continue
+                        finish = chunk.get("choices", [{}])[0].get("finish_reason")
+                        ollama_chunk = {
+                            "message": {"role": "assistant", "content": content},
+                            "done": finish == "stop",
+                        }
+                        yield json.dumps(ollama_chunk)
+                    except Exception:
+                        pass
+        # Ensure a final done=true
+        yield json.dumps({"message": {"role": "assistant", "content": ""}, "done": True})
+    else:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            async with client.stream(
+                "POST",
+                f"{OLLAMA_URL}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": messages,
+                    "stream": True,
+                    "options": {"temperature": temperature, "num_predict": max_tokens},
+                },
+            ) as response:
+                async for line in response.aiter_lines():
+                    if line.strip():
+                        yield line
+
 
 # ═══════════════════  TOOL IMPLEMENTATIONS  ═══════════════════
 # These are only used when ENABLED_TOOLS includes the tool.
@@ -477,9 +624,10 @@ async def lifespan(app: FastAPI):
         logger.info("RAG disabled via RAG_ENABLED=false")
 
     mode = "agent" if IS_AGENT else "chatbot"
+    provider_info = f"Sarvam ({SARVAM_MODEL})" if _use_sarvam() else f"Ollama at {OLLAMA_URL}, model {OLLAMA_MODEL}"
     logger.info(
         f"Chatbot '{CHATBOT_NAME}' started — "
-        f"mode={mode}, Ollama at {OLLAMA_URL}, model {OLLAMA_MODEL}"
+        f"mode={mode}, LLM: {provider_info}"
         + (f", tools: {ENABLED_TOOLS}" if ENABLED_TOOLS else "")
     )
     yield
@@ -599,7 +747,8 @@ async def health():
     return {
         "status": "healthy",
         "chatbot_name": CHATBOT_NAME,
-        "model": OLLAMA_MODEL,
+        "model": SARVAM_MODEL if _use_sarvam() else OLLAMA_MODEL,
+        "llm_provider": LLM_PROVIDER,
         "rag_enabled": RAG_ENABLED,
         "rag_documents": rag_engine.document_count() if rag_engine else 0,
     }
@@ -676,12 +825,7 @@ async def _check_enquiry_and_notify(conversation: list[dict]) -> dict:
             "Does this conversation match the notification criteria above? Reply with ONLY 'YES' or 'NO'."
         )
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": classify_prompt, "stream": False, "options": {"temperature": 0, "num_predict": 10}},
-            )
-            answer = resp.json().get("response", "").strip().upper()
+        answer = (await _llm_generate(classify_prompt, temperature=0, max_tokens=10)).upper()
 
         if "YES" not in answer:
             return {"notified": False, "reason": "not_enquiry"}
@@ -708,12 +852,7 @@ async def _check_enquiry_and_notify(conversation: list[dict]) -> dict:
             "- Do NOT wrap in quotes or add any preamble — output ONLY the email body"
         )
 
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": email_prompt, "stream": False, "options": {"temperature": 0.3, "num_predict": 600}},
-            )
-            email_body = resp.json().get("response", "").strip()
+        email_body = await _llm_generate(email_prompt, temperature=0.3, max_tokens=600)
 
         if not email_body or len(email_body) < 20:
             logger.warning("[enquiry] LLM generated empty or too-short email body")
@@ -864,28 +1003,17 @@ async def chat(req: ChatRequest):
 
         async def generate():
             try:
-                async with httpx.AsyncClient(timeout=180.0) as client:
-                    async with client.stream(
-                        "POST",
-                        f"{OLLAMA_URL}/api/chat",
-                        json={
-                            "model": OLLAMA_MODEL,
-                            "messages": messages,
-                            "stream": True,
-                            "options": {"temperature": 0.3, "num_predict": 4096},
-                        },
-                    ) as response:
-                        async for line in response.aiter_lines():
-                            if line.strip():
-                                # Collect assistant content for saving
-                                try:
-                                    chunk = json.loads(line)
-                                    content = chunk.get("message", {}).get("content", "")
-                                    if content:
-                                        collected_response.append(content)
-                                except Exception:
-                                    pass
-                                yield line + "\n"
+                async for line in _llm_chat_stream(messages, temperature=0.3, max_tokens=4096):
+                    if line.strip():
+                        # Collect assistant content for saving
+                        try:
+                            chunk = json.loads(line)
+                            content = chunk.get("message", {}).get("content", "")
+                            if content:
+                                collected_response.append(content)
+                        except Exception:
+                            pass
+                        yield line + "\n"
             except httpx.ConnectError:
                 yield (
                     '{"error": "AI model is starting up. Please try again in a moment."}\n'
@@ -922,18 +1050,8 @@ async def chat(req: ChatRequest):
         )
     else:
         try:
-            async with httpx.AsyncClient(timeout=180.0) as client:
-                resp = await client.post(
-                    f"{OLLAMA_URL}/api/chat",
-                    json={
-                        "model": OLLAMA_MODEL,
-                        "messages": messages,
-                        "stream": False,
-                        "options": {"temperature": 0.3, "num_predict": 4096},
-                    },
-                )
-                data = resp.json()
-                assistant_content = data.get("message", {}).get("content", "")
+            data = await _llm_chat_nonstream(messages, temperature=0.3, max_tokens=4096)
+            assistant_content = data.get("message", {}).get("content", "")
 
                 # Post-response: enquiry detection + email notification
                 if conv_snapshot:

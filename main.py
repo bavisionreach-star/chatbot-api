@@ -726,15 +726,6 @@ def _build_system_prompt(user_query: str, conversation_messages: list = None) ->
     """Build the full system prompt, optionally with RAG context and notification instructions."""
     base = SYSTEM_PROMPT
 
-    # Scope restriction: stick to the role defined in the system prompt
-    base += (
-        "\n\n## IMPORTANT BEHAVIOURAL RULES\n"
-        "- You MUST strictly follow the role described above. Do NOT deviate from it.\n"
-        "- Do NOT write code, give implementation details, debug errors, or act as a developer/consultant.\n"
-        "- If a user asks for something outside your role, politely explain that your role is limited "
-        "and offer to collect their request so the appropriate team can follow up.\n"
-    )
-
     # Inject notification-aware behaviour when email notifications are enabled
     if _notification_config["enabled"] and _notification_config["notify_when"]:
         notify_when = _notification_config["notify_when"]
@@ -743,7 +734,8 @@ def _build_system_prompt(user_query: str, conversation_messages: list = None) ->
             "The owner of this chatbot has enabled email notifications for enquiries. "
             f"An enquiry is defined as: {notify_when}\n\n"
             "When you detect that a conversation is heading toward an enquiry situation:\n"
-            "1. First, help the user with their question as best you can.\n"
+            "1. Answer general questions about the company, products, or services using your knowledge. "
+            "Do NOT write code, provide technical implementations, or debug errors — that is outside your scope.\n"
             "2. When the topic requires human follow-up (pricing quotes, complaints, custom requests, "
             "demo scheduling, partnership proposals, or anything you cannot fully resolve), "
             "naturally ask for the visitor\'s **name** (if not already known), **email address**, and **company name** (if relevant).\n"
@@ -781,6 +773,17 @@ def _build_system_prompt(user_query: str, conversation_messages: list = None) ->
                 )
         except Exception as e:
             logger.warning(f"RAG search failed: {e}")
+
+    # Scope restriction at the end so it takes highest priority
+    base += (
+        "\n\n## CRITICAL BEHAVIOURAL RULES (MUST FOLLOW)\n"
+        "- You are a SUPPORT ASSISTANT only. You MUST strictly follow the role described at the top of this prompt.\n"
+        "- NEVER write code, provide code snippets, give implementation details, debug errors, or act as a developer/consultant.\n"
+        "- If a user asks you to write code, build something, or provide technical implementations, "
+        "politely decline and explain that you are a support assistant. Offer to collect their request "
+        "and pass it to the appropriate technical team.\n"
+        "- Keep responses concise, helpful, and focused on support/enquiry handling.\n"
+    )
 
     return base
 

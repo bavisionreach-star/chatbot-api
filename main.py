@@ -1091,17 +1091,27 @@ async def chat(req: ChatRequest):
 
         async def generate():
             try:
-                async for line in _llm_chat_stream(messages, temperature=0.3, max_tokens=4096):
-                    if line.strip():
-                        # Collect assistant content for saving
-                        try:
-                            chunk = json.loads(line)
-                            content = chunk.get("message", {}).get("content", "")
-                            if content:
-                                collected_response.append(content)
-                        except Exception:
-                            pass
-                        yield line + "\n"
+                if _use_sarvam():
+                    # Sarvam streaming is unreliable (reasoning consumes all tokens),
+                    # so use non-streaming and emit the full response as a single chunk.
+                    data = await _llm_chat_nonstream(messages, temperature=0.3, max_tokens=4096)
+                    content = data.get("message", {}).get("content", "")
+                    if content:
+                        collected_response.append(content)
+                        yield json.dumps({"message": {"role": "assistant", "content": content}, "done": False}) + "\n"
+                    yield json.dumps({"message": {"role": "assistant", "content": ""}, "done": True}) + "\n"
+                else:
+                    async for line in _llm_chat_stream(messages, temperature=0.3, max_tokens=4096):
+                        if line.strip():
+                            # Collect assistant content for saving
+                            try:
+                                chunk = json.loads(line)
+                                content = chunk.get("message", {}).get("content", "")
+                                if content:
+                                    collected_response.append(content)
+                            except Exception:
+                                pass
+                            yield line + "\n"
             except httpx.ConnectError:
                 yield (
                     '{"error": "AI model is starting up. Please try again in a moment."}\n'

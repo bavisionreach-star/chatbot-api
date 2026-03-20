@@ -896,6 +896,7 @@ async def _refresh_notification_config():
                     _notification_config["enabled"] = cfg.get("email_notifications", False)
                     _notification_config["notify_when"] = cfg.get("notify_when", "")
                     _notification_config["owner_email"] = cfg.get("owner_email", "")
+                    _notification_config["ticket_prefix"] = cfg.get("ticket_prefix", "")
                     _notification_config["last_refresh"] = now
         except Exception as e:
             logger.warning(f"[enquiry] Config refresh failed: {e}")
@@ -924,11 +925,11 @@ async def _fetch_ticket_status(session_id: str = "", ticket_number: str = "") ->
     return []
 
 
-_TICKET_NUMBER_RE = re.compile(r"BV-\d+", re.IGNORECASE)
+_TICKET_NUMBER_RE = re.compile(r"[A-Za-z0-9]{1,10}-\d{1,6}", re.IGNORECASE)
 
 
 _TICKET_QUERY_KEYWORDS = re.compile(
-    r"(ticket|status|follow[- ]?up|request|enquiry|inquiry|update|progress|BV-\d+)",
+    r"(ticket|status|follow[- ]?up|request|enquiry|inquiry|update|progress|[A-Za-z0-9]{1,10}-\d{4,})",
     re.IGNORECASE,
 )
 

@@ -901,13 +901,15 @@ async def _refresh_notification_config():
             logger.warning(f"[enquiry] Config refresh failed: {e}")
 
 
-async def _fetch_ticket_status(session_id: str) -> list[dict]:
-    """Query the backend for service tickets associated with this chatbot/session."""
+async def _fetch_ticket_status(session_id: str = "", ticket_number: str = "") -> list[dict]:
+    """Query the backend for service tickets. Supports lookup by session_id or ticket_number."""
     if not CHATBOT_IDENTIFIER or not BACKEND_INTERNAL_URL:
         return []
     try:
         params = {}
-        if session_id:
+        if ticket_number:
+            params["ticket_number"] = ticket_number
+        elif session_id:
             params["session_id"] = session_id
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
@@ -920,6 +922,9 @@ async def _fetch_ticket_status(session_id: str) -> list[dict]:
     except Exception as e:
         logger.warning(f"[tickets] Failed to fetch ticket status: {e}")
     return []
+
+
+_TICKET_NUMBER_RE = re.compile(r"BV-\d+", re.IGNORECASE)
 
 
 _TICKET_QUERY_KEYWORDS = re.compile(
@@ -1225,7 +1230,13 @@ async def chat(req: ChatRequest):
     # ── Inject ticket status if user asks about their request/ticket ──
     if _TICKET_QUERY_KEYWORDS.search(latest_query):
         try:
-            tickets = await _fetch_ticket_status(session_id)
+            # Extract explicit ticket number (BV-XXXX) from the query
+            tn_match = _TICKET_NUMBER_RE.search(latest_query)
+            explicit_ticket = tn_match.group().upper() if tn_match else ""
+            tickets = await _fetch_ticket_status(
+                session_id=session_id,
+                ticket_number=explicit_ticket,
+            )
             if tickets:
                 ticket_info = "\n".join(
                     f"- Ticket **{t['ticket_number']}**: status = {t['status']}, "

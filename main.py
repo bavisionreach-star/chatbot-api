@@ -901,6 +901,33 @@ async def _refresh_notification_config():
             logger.warning(f"[enquiry] Config refresh failed: {e}")
 
 
+async def _fetch_ticket_status(session_id: str) -> list[dict]:
+    """Query the backend for service tickets associated with this chatbot/session."""
+    if not CHATBOT_IDENTIFIER or not BACKEND_INTERNAL_URL:
+        return []
+    try:
+        params = {}
+        if session_id:
+            params["session_id"] = session_id
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{BACKEND_INTERNAL_URL}/api/internal/chatbot-ticket-status/{CHATBOT_IDENTIFIER}",
+                headers={"X-Internal-Secret": INTERNAL_API_SECRET},
+                params=params,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("tickets", [])
+    except Exception as e:
+        logger.warning(f"[tickets] Failed to fetch ticket status: {e}")
+    return []
+
+
+_TICKET_QUERY_KEYWORDS = re.compile(
+    r"(ticket|status|follow[- ]?up|request|enquiry|inquiry|update|progress|BV-\d+)",
+    re.IGNORECASE,
+)
+
+
 async def _check_enquiry_and_notify(conversation: list[dict], session_id: str = "") -> dict:
     """Analyse the full conversation for enquiry + contact details, then notify owner.
     Uses service tickets to prevent duplicate emails. Returns ticket info so the caller can inform the user."""
@@ -1194,6 +1221,40 @@ async def chat(req: ChatRequest):
 
     # ── Build final system prompt ──
     system_prompt = _build_system_prompt(latest_query, [{"role": m.role, "content": m.content} for m in req.messages])
+
+    # ── Inject ticket status if user asks about their request/ticket ──
+    if _TICKET_QUERY_KEYWORDS.search(latest_query):
+        try:
+            tickets = await _fetch_ticket_status(session_id)
+            if tickets:
+                ticket_info = "\n".join(
+                    f"- Ticket **{t['ticket_number']}**: status = {t['status']}, "
+                    f"subject = \"{t['subject']}\", "
+                    f"created = {t['created_at'][:10] if t.get('created_at') else 'N/A'}, "
+                    f"updates sent = {t.get('email_count', 1)}"
+                    for t in tickets
+                )
+                system_prompt += (
+                    "\n\n## SERVICE TICKET INFO FOR THIS SESSION\n"
+                    "The user is asking about the status of their request. "
+                    "Here are their service tickets:\n"
+                    + ticket_info + "\n\n"
+                    "Use this information to answer their question about ticket status. "
+                    "Be conversational and reassuring. If the status is 'open', let them know "
+                    "the team has received their request and is working on it. "
+                    "Mention the ticket number so they can reference it."
+                )
+            elif session_id in _session_tickets:
+                # We have a cached ticket number but couldn't fetch details
+                ticket_num = _session_tickets[session_id]
+                system_prompt += (
+                    f"\n\n## SERVICE TICKET INFO\n"
+                    f"This user has an open ticket: **{ticket_num}**. "
+                    f"Let them know their request is being tracked under this ticket number "
+                    f"and the team will follow up."
+                )
+        except Exception as e:
+            logger.warning(f"[tickets] Failed to inject ticket context: {e}")
 
     if research_context:
         system_prompt += "\n\n" + research_context

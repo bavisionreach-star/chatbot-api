@@ -1240,20 +1240,22 @@ async def chat(req: ChatRequest):
             if tickets:
                 ticket_info = "\n".join(
                     f"- Ticket **{t['ticket_number']}**: status = {t['status']}, "
-                    f"subject = \"{t['subject']}\", "
+                    f"customer = \"{t.get('customer_name', 'N/A')}\", "
                     f"created = {t['created_at'][:10] if t.get('created_at') else 'N/A'}, "
                     f"updates sent = {t.get('email_count', 1)}"
                     for t in tickets
                 )
                 system_prompt += (
-                    "\n\n## SERVICE TICKET INFO FOR THIS SESSION\n"
-                    "The user is asking about the status of their request. "
-                    "Here are their service tickets:\n"
+                    "\n\n## SERVICE TICKET INFO (HIGHEST PRIORITY)\n"
+                    "The user is asking about a specific service ticket. "
+                    "You MUST answer their question about the ticket IMMEDIATELY — "
+                    "do NOT ask for their name or details first. "
+                    "Here are the matching tickets:\n"
                     + ticket_info + "\n\n"
-                    "Use this information to answer their question about ticket status. "
-                    "Be conversational and reassuring. If the status is 'open', let them know "
-                    "the team has received their request and is working on it. "
-                    "Mention the ticket number so they can reference it."
+                    "Respond with the ticket status right away. Be conversational and reassuring. "
+                    "If the status is 'open', let them know the team has received their request and is working on it. "
+                    "If 'closed', let them know it has been resolved. "
+                    "Always mention the ticket number so they can reference it."
                 )
             elif session_id in _session_tickets:
                 # We have a cached ticket number but couldn't fetch details

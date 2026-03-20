@@ -249,6 +249,12 @@ async def _llm_generate(prompt: str, temperature: float = 0, max_tokens: int = 1
                 },
             )
             data = resp.json()
+            # Gemini error responses return a JSON array, not object
+            if isinstance(data, list) or resp.status_code >= 400:
+                err = data[0] if isinstance(data, list) else data
+                err_msg = err.get("error", {}).get("message", "") if isinstance(err, dict) else str(err)
+                logger.warning(f"[gemini] API error {resp.status_code}: {err_msg[:200]}")
+                return ""
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             usage = data.get("usage", {})
             asyncio.create_task(_report_gemini_usage(
@@ -288,6 +294,14 @@ async def _llm_chat_nonstream(messages: list[dict], temperature: float = 0.3, ma
                 },
             )
             data = resp.json()
+            # Gemini error responses return a JSON array, not object
+            if isinstance(data, list) or resp.status_code >= 400:
+                err = data[0] if isinstance(data, list) else data
+                err_msg = err.get("error", {}).get("message", "") if isinstance(err, dict) else str(err)
+                logger.warning(f"[gemini] API error {resp.status_code}: {err_msg[:200]}")
+                if resp.status_code == 429:
+                    raise Exception("AI model is temporarily busy. Please try again in a moment.")
+                raise Exception("AI service encountered an error. Please try again.")
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             usage = data.get("usage", {})
             asyncio.create_task(_report_gemini_usage(
@@ -332,6 +346,16 @@ async def _llm_chat_stream(messages: list[dict], temperature: float = 0.3, max_t
                     "max_tokens": max_tokens,
                 },
             ) as response:
+                # Check for error status before streaming
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    logger.warning(f"[gemini] Stream error {response.status_code}: {body[:300]}")
+                    if response.status_code == 429:
+                        err_chunk = json.dumps({"message": {"role": "assistant", "content": "I'm temporarily busy due to high demand. Please try again in a moment."}, "done": True})
+                    else:
+                        err_chunk = json.dumps({"message": {"role": "assistant", "content": "I encountered an error. Please try again."}, "done": True})
+                    yield err_chunk
+                    return
                 async for line in response.aiter_lines():
                     line = line.strip()
                     if not line or line == "data: [DONE]":
